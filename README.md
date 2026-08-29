@@ -92,11 +92,23 @@ py -V:Astral\CPython3.11.15 -m venv .venv
 
 ## Build a standalone binary (manual)
 
+You must build on the **target OS** (a Windows `dist/` will not run on Linux and vice-versa). Do not copy `dist/` between OSes; rebuild from source.
+
 ```powershell
+# Windows
 .venv\Scripts\pip install pyinstaller
 .venv\Scripts\pyinstaller packaging/vocalis.spec  # → dist/Vocalis/Vocalis.exe
-# or: powershell packaging/build.ps1  /  bash packaging/build.sh
+# or: powershell packaging/build.ps1
 ```
+```bash
+# Linux / macOS
+.venv/bin/pip install pyinstaller
+.venv/bin/pyinstaller packaging/vocalis.spec  # → dist/Vocalis/Vocalis
+# or: bash packaging/build.sh
+# or one-liner:
+bash scripts/install.sh   # builds dist/Vocalis/Vocalis by default
+```
+The spec now uses `packaging/entry.py` (not `src/vocalis/__main__.py` directly) to avoid the `ImportError: attempted relative import with no known parent package` seen in PyInstaller builds.
 
 ## Logs — it closed before I could check? Never again
 

@@ -52,7 +52,7 @@ except Exception:
     pass
 
 a = Analysis(
-    [str(ROOT / "src" / "vocalis" / "__main__.py")],
+    [str(ROOT / "packaging" / "entry.py")],
     pathex=[str(ROOT / "src")],
     binaries=[],
     datas=datas,

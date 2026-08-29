@@ -23,9 +23,16 @@ if [ -z "$PY" ]; then
   exit 1
 fi
 
-# 2. System deps hint
+# 2. System deps — auto-install PortAudio/scipy prereqs on Debian/Ubuntu
 if command -v apt-get >/dev/null 2>&1; then
-  echo "If pip install fails on audio, run: sudo apt install portaudio19-dev python3.11-venv"
+  if ! dpkg -l | grep -q "portaudio19-dev" 2>/dev/null; then
+    echo "Installing system deps: portaudio19-dev, libportaudio2, python3.11-venv (needs sudo)..."
+    sudo apt-get update && sudo apt-get install -y portaudio19-dev libportaudio2 python3.11-venv || echo "apt install failed — please run manually: sudo apt install portaudio19-dev libportaudio2"
+  fi
+  # Also ensure scipy system deps are present (openwakeword needs it)
+  if ! python3 -c "import scipy" 2>/dev/null; then
+    echo "Note: scipy will be pip-installed with vocalis (openwakeword needs it)"
+  fi
 fi
 
 # 3. venv

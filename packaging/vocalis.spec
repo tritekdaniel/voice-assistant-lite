@@ -26,6 +26,9 @@ hidden += collect_submodules("faster_whisper")
 hidden += collect_submodules("openwakeword")
 hidden += collect_submodules("kokoro")
 hidden += collect_submodules("sounddevice")
+hidden += collect_submodules("scipy")
+hidden += collect_submodules("scipy.signal")
+hidden += collect_submodules("scipy.special")
 # openai + platformdirs are lightweight but ensure hooks
 hidden += collect_submodules("openai")
 
@@ -62,7 +65,8 @@ a = Analysis(
     excludes=[
         "torch.cuda", "torch.backends.cuda", "torch.backends.cudnn",
         "torch.distributed", "triton",
-        "matplotlib", "scipy",
+        "matplotlib",
+        # DO NOT exclude scipy — openwakeword/custom_verifier_model.py requires it
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

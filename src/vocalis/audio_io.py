@@ -83,6 +83,10 @@ class AudioIn:
             self._stream.start()
             log.info("AudioIn started device=%s block=%s (InputStream)", self._device, FRAME_SAMPLES)
         except BaseException as e:
+            # Provide actionable hint for Linux binary missing system lib
+            msg = str(e)
+            if "PortAudio" in msg and "not found" in msg:
+                e = OSError(f"{e} — on Linux install system PortAudio: sudo apt install portaudio19-dev libportaudio2, then rebuild or run .venv/bin/python -m vocalis")
             log.exception("AudioIn start failed device=%s: %s", self._device, e)
             raise
 

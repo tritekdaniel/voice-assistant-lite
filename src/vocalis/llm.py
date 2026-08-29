@@ -8,12 +8,14 @@ log = get_logger(__name__)
 
 
 class History:
-    """Chat history with a fixed system prompt and a sliding message window."""
+    """Chat history with a fixed system prompt, sliding window, and optional compaction."""
 
-    def __init__(self, system_prompt: str, max_messages: int = 40):
+    def __init__(self, system_prompt: str, max_messages: int = 40, compact_after: int = 30):
         self._system = {"role": "system", "content": system_prompt}
         self._max = max(2, max_messages)
+        self._compact_after = max(10, compact_after)
         self._turns: list[dict] = []
+        self._summary: str | None = None  # compacted summary of older turns
 
     def add_user(self, text: str) -> None:
         self._turns.append({"role": "user", "content": text})
@@ -24,13 +26,50 @@ class History:
         self._trim()
 
     def messages(self) -> list[dict]:
+        # If we have a summary, inject it as a system note after the main system prompt
+        if self._summary:
+            return [self._system, {"role": "system", "content": self._summary}] + self._turns
         return [self._system] + self._turns
 
     def clear(self) -> None:
         """Forget all previous turns, keep only system prompt."""
         self._turns.clear()
+        self._summary = None
+
+    def compact(self, keep: int | None = None) -> str | None:
+        """Compact older history into a summary, keeping `keep` most recent turns. Returns summary."""
+        keep = keep if keep is not None else self._compact_after
+        if len(self._turns) <= keep:
+            return None
+        # Older turns to compact
+        older = self._turns[:-keep]
+        recent = self._turns[-keep:]
+        # Build a deterministic compact summary (no LLM call — keeps it offline/fast).
+        # Summarize as: last N turns + key facts.
+        lines: list[str] = []
+        for m in older[-12:]:  # last 12 of the older chunk to avoid huge summary
+            role = m.get("role", "?")
+            content = (m.get("content") or "").strip().replace("\n", " ")
+            if len(content) > 140:
+                content = content[:137] + "..."
+            if content:
+                lines.append(f"{role}: {content}")
+        summary = (
+            f"[Conversation so far — {len(older)} earlier messages compacted. "
+            f"Recent context kept: {len(recent)} messages. Key excerpts: "
+            + " | ".join(lines)
+            + "]"
+        )
+        self._summary = summary
+        self._turns = recent
+        log.debug("History compacted: %d -> %d turns (compact_after=%d)", len(older)+len(recent), len(recent), self._compact_after)
+        return summary
 
     def _trim(self) -> None:
+        # Compact when we exceed compact_after (preserve mode), otherwise trim to max
+        if len(self._turns) > self._compact_after:
+            # Keep at most compact_after messages; compact older ones into summary
+            self.compact(keep=self._compact_after)
         overflow = len(self._turns) - self._max
         if overflow > 0:
             del self._turns[:overflow]

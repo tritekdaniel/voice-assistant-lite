@@ -499,6 +499,25 @@ class SettingsDialog(QDialog):
         self._sys.setPlaceholderText("System prompt")
         form.addRow("System prompt", self._sys)
 
+        # History: forget vs preserve+compact
+        from PySide6.QtWidgets import QCheckBox
+        self._preserve = QCheckBox("Preserve conversation history (compact after 30)")
+        self._preserve.setChecked(bool(getattr(cfg, "preserve_history", False)))
+        self._preserve.setToolTip("If off, each turn is forgotten (stateless). If on, last 30 messages are kept and older ones are compacted into a summary.")
+        self._preserve.stateChanged.connect(self._on_preserve_changed)
+        form.addRow("", self._preserve)
+        self._compact_spin = QSpinBox()
+        self._compact_spin.setRange(10, 100)
+        self._compact_spin.setValue(int(getattr(cfg, "compact_after", 30)))
+        self._compact_spin.setSuffix(" msgs")
+        self._compact_spin.setToolTip("When preserving, compact when history exceeds this many messages")
+        self._compact_spin.setEnabled(self._preserve.isChecked())
+        form.addRow("Compact after", self._compact_spin)
+        self._lbl_history = QLabel("Off: each reply forgets prior chat. On: keeps last 30 and compacts older into a summary (no LLM call).")
+        self._lbl_history.setStyleSheet("color:#64748b; font-size:11px;")
+        self._lbl_history.setWordWrap(True)
+        form.addRow("", self._lbl_history)
+
         lay.addLayout(form)
 
         # test LLM row
@@ -1065,7 +1084,19 @@ class SettingsDialog(QDialog):
         c.vad_silence_seconds = float(self._silence.value())
         c.max_utterance_seconds = float(self._max_utt.value())
         c.idle_timeout_seconds = float(self._idle.value())
+        c.preserve_history = bool(self._preserve.isChecked())
+        c.compact_after = int(self._compact_spin.value())
+        # keep forget_history in sync for back-compat (preserve overrides)
+        c.forget_history = not c.preserve_history
         self.accept()
+
+    def _on_preserve_changed(self, _state: int) -> None:
+        on = self._preserve.isChecked()
+        self._compact_spin.setEnabled(on)
+        if on:
+            self._lbl_history.setText("On: keeps last N messages; older ones are compacted into a summary so context is preserved without growing forever.")
+        else:
+            self._lbl_history.setText("Off: each reply forgets prior chat. On: keeps last 30 and compacts older into a summary (no LLM call).")
 
     def _confirm_uninstall(self, keep_models: bool) -> None:
         if keep_models:

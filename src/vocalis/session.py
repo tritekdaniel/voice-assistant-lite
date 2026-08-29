@@ -525,9 +525,23 @@ class Session:
             self._enter_listening()
             return
         # forget history if requested (stateless) — but keep system prompt
-        if getattr(self.cfg, "forget_history", False):
+        # History handling: forget vs preserve+compact
+        forget = bool(getattr(self.cfg, "forget_history", False))
+        preserve = bool(getattr(self.cfg, "preserve_history", False))
+        # preserve overrides forget when both are set
+        if preserve:
+            forget = False
+        if forget:
             log.debug("Forgetting history (forget_history=True)")
             self._history.clear()
+        elif preserve:
+            # Compact when we exceed compact_after (default 30)
+            try:
+                ca = int(getattr(self.cfg, "compact_after", 30))
+            except Exception:
+                ca = 30
+            if len(self._history._turns) > ca:  # type: ignore[attr-defined]
+                self._history.compact(keep=ca)  # type: ignore[attr-defined]
         self._set_state(State.SPEAKING)
 
     def _speak_sentence(self, sent: str) -> None:
@@ -602,7 +616,8 @@ class SessionFactory:
             Transcriber(self.cfg.whisper_model),
             LLMClient(self.cfg.llm_base_url, self.cfg.llm_model,
                       self.cfg.llm_api_key, self.cfg.temperature),
-            History(self.cfg.system_prompt, self.cfg.max_history_messages),
+            History(self.cfg.system_prompt, self.cfg.max_history_messages,
+                    compact_after=getattr(self.cfg, "compact_after", 30)),
             Speaker(self.cfg.tts_voice, self.cfg.tts_speed),
             listener,
             sounds=sounds,

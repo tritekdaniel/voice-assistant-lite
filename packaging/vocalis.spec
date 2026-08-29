@@ -22,21 +22,23 @@ icon = ICON_ICO if Path(ICON_ICO).exists() else (ICON_PNG if Path(ICON_PNG).exis
 block_cipher = None
 
 hidden = []
+# Keep hiddenimports lean — collecting all of scipy/tensorflow OOMs Linux (was crashing).
+# Only pull what we actually need; PyInstaller will discover transitive deps.
 hidden += collect_submodules("faster_whisper")
 hidden += collect_submodules("openwakeword")
 hidden += collect_submodules("kokoro")
 hidden += collect_submodules("sounddevice")
-hidden += collect_submodules("scipy")
-hidden += collect_submodules("scipy.signal")
-hidden += collect_submodules("scipy.special")
-# onnxruntime + tflite for wake word (onnx preferred on Linux, tflite fallback)
+# scipy: only the bits openwakeword actually uses (signal/special), not the whole 200-module tree
+for _m in ("scipy.signal", "scipy.special", "scipy.linalg", "scipy.spatial"):
+    try:
+        hidden += collect_submodules(_m)
+    except Exception:
+        pass
+# onnxruntime for wake word (onnx preferred on Linux)
 hidden += collect_submodules("onnxruntime")
+# Do NOT collect tensorflow — huge (500 MB) and not needed; tflite_runtime is tiny if present
 try:
     hidden += collect_submodules("tflite_runtime")
-except Exception:
-    pass
-try:
-    hidden += collect_submodules("tensorflow")
 except Exception:
     pass
 # openai + platformdirs are lightweight but ensure hooks
@@ -69,6 +71,17 @@ try:
 except Exception:
     pass
 
+# Linux OOM guard: on low-RAM machines PyInstaller can get killed. Keep excludes aggressive.
+_excludes = [
+    "torch.cuda", "torch.backends.cuda", "torch.backends.cudnn",
+    "torch.distributed", "triton",
+    "matplotlib", "matplotlib.tests", "mpl_toolkits",
+    "numpy.tests", "numpy.distutils", "scipy.tests",
+    "PIL", "cv2", "tkinter", "IPython", "jupyter",
+    "tensorflow", "tensorflow.python",  # not needed — we use onnx
+    # DO NOT exclude scipy.signal/special — openwakeword/custom_verifier_model.py requires it
+]
+
 a = Analysis(
     [str(ROOT / "packaging" / "entry.py")],
     pathex=[str(ROOT / "src")],
@@ -77,12 +90,7 @@ a = Analysis(
     hiddenimports=hidden,
     hookspath=[],
     runtime_hooks=[],
-    excludes=[
-        "torch.cuda", "torch.backends.cuda", "torch.backends.cudnn",
-        "torch.distributed", "triton",
-        "matplotlib",
-        # DO NOT exclude scipy — openwakeword/custom_verifier_model.py requires it
-    ],
+    excludes=_excludes,
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -90,6 +98,11 @@ a = Analysis(
 )
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+# UPX on Linux is RAM-hungry; disable it there to avoid OOM crashes.
+import sys as _sys
+_is_linux = _sys.platform.startswith("linux")
+_use_upx = not _is_linux  # Windows keeps UPX, Linux skips it
 
 exe = EXE(
     pyz,
@@ -99,8 +112,8 @@ exe = EXE(
     name="Vocalis",
     debug=False,
     bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
+    strip=True if _is_linux else False,
+    upx=_use_upx,
     console=False,
     icon=icon,
     # Windows: no console, still handles --check/--headless via console=False?
@@ -112,7 +125,7 @@ coll = COLLECT(
     a.binaries,
     a.zipfiles,
     a.datas,
-    strip=False,
-    upx=True,
+    strip=True if _is_linux else False,
+    upx=_use_upx,
     name="Vocalis",
 )

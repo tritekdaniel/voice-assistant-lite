@@ -55,19 +55,45 @@ echo "Installing vocalis (pip install -e .) ..."
 "$PIP" install -e "$ROOT" --upgrade
 
 # 6. standalone binary (preferred) — skip with --no-binary
+# Linux OOM guard: building the binary needs ~3 GB RAM (torch+scipy). On low-RAM machines it
+# can make the machine appear to crash/OOM-kill. Check first and offer venv-only fallback.
 BINARY="$ROOT/dist/Vocalis/Vocalis"
-if [ "$NO_BINARY" -eq 0 ]; then
+_should_build=1
+if [ "$NO_BINARY" -ne 0 ]; then
+  _should_build=0
+else
+  # Check available RAM (Linux); if <3.5 GB, warn and skip unless --with-binary forced
+  _force=0
+  for a in "$@"; do case "$a" in --with-binary) _force=1;; esac; done
+  if [ "$_force" -eq 0 ] && [ -f /proc/meminfo ]; then
+    _avail_kb=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    _avail_mb=$((_avail_kb / 1024))
+    if [ "$_avail_mb" -gt 0 ] && [ "$_avail_mb" -lt 3500 ]; then
+      echo ""
+      echo "Low RAM detected (${_avail_mb} MB available) — PyInstaller binary needs ~3 GB and will"
+      echo "likely OOM/crash. Skipping binary build and using venv mode (faster, same features)."
+      echo "To force the build anyway: bash scripts/install.sh --with-binary"
+      _should_build=0
+    fi
+  fi
+fi
+if [ "$_should_build" -eq 1 ]; then
   echo ""
   echo "Building standalone binary (PyInstaller, ~1.5 GB, a few minutes) ..."
+  echo "If this crashes/hangs, re-run with --no-binary to use venv mode (recommended on <4 GB RAM)."
+  # Limit parallelism to reduce RAM spike
+  export PYINSTALLER_COMPILE_BOOTLOADER=0
   "$PIP" install --upgrade pyinstaller >/dev/null 2>&1 || true
-  if "$VENV/bin/pyinstaller" packaging/vocalis.spec --noconfirm --clean; then
+  # Single-threaded, low-memory build: strip + no UPX on Linux (see spec)
+  if "$VENV/bin/pyinstaller" packaging/vocalis.spec --noconfirm --clean --log-level=WARN; then
     echo "Binary built: $BINARY"
   else
     echo "Binary build failed — falling back to venv script"
+    echo "Tip: use --no-binary for venv-only install: bash scripts/install.sh --no-binary"
     BINARY=""
   fi
 else
-  echo "Skipping binary build (--no-binary)"
+  if [ "$NO_BINARY" -ne 0 ]; then echo "Skipping binary build (--no-binary)"; fi
   BINARY=""
 fi
 

@@ -18,7 +18,7 @@ _CANCEL_RE = re.compile(r"\b(?:stop|cancel|clear|end)\s+(?:the\s+)?timer\b|\bsto
 
 
 class TimerManager:
-    """Manages a single countdown timer that plays Lithium 5× when fired."""
+    """Manages a single countdown timer that plays a sound 5× when fired."""
 
     def __init__(self, sounds: Sounds):
         self._sounds = sounds
@@ -54,7 +54,7 @@ class TimerManager:
                 self._active_label = None
                 self._timer = None
                 self._start_monotonic = None
-            # Play Lithium 5 times — this is cancellable via stop_timer_loop
+            # Play alarm 5 times — cancellable via stop_timer_loop
             self._sounds.play_timer_loop(loops=5)
         with self._lock:
             self._active_label = label
@@ -63,7 +63,7 @@ class TimerManager:
             self._timer = threading.Timer(seconds, _fire)
             self._timer.daemon = True
             self._timer.start()
-        return f"Timer set for {seconds} seconds. I'll play Lithium 5 times when it rings. Say 'stop timer' to cancel."
+        return f"Timer set for {seconds} seconds. A sound will play when it rings. Say 'stop timer' to cancel."
 
     def cancel(self) -> str:
         with self._lock:
@@ -124,7 +124,7 @@ def get_timer_tools() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "set_timer",
-                "description": "Set a countdown timer. When it fires, the Lithium sound will play 5 times in a loop unless the user says 'stop timer'. Use this when the user asks to set a timer, reminder, or alarm.",
+                "description": "Set a countdown timer. When it fires, a sound will play in a loop until the user says 'stop timer'. Use this when the user asks to set a timer, reminder, or alarm.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -139,7 +139,7 @@ def get_timer_tools() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "stop_timer",
-                "description": "Stop/cancel the active timer and its Lithium loop. Use when user says stop timer, cancel timer, or similar.",
+                "description": "Stop/cancel the active timer and its alarm sound. Use when user says stop timer, cancel timer, or similar.",
                 "parameters": {"type": "object", "properties": {}, "required": []},
             },
         },

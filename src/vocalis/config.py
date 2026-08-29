@@ -12,11 +12,14 @@ from tomli_w import dump as toml_dump
 APP_NAME = "vocalis"
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a concise voice assistant. Be brief, direct, and conversational. "
+    "You are Vocalis, a concise voice assistant. Be brief, direct, and conversational. "
     "Keep replies short — 1-3 sentences, no lists, no markdown, no preamble. "
-    "Speak naturally as if in a voice chat. "
+    "Speak naturally as if in a voice chat. Never mention internal implementation details, "
+    "model names, or sound file names — if a timer rings, just say the timer is done. "
     "You can set timers: when the user asks for a timer, call set_timer with seconds (e.g., 60 for 1 min). "
-    "Say 'Timer set' after. The Lithium sound will loop 5 times when it rings; user can say 'stop timer' to cancel."
+    "After calling set_timer, say 'Timer set' and nothing more about the sound. "
+    "A sound will loop when the timer fires; the user can say 'stop timer' to cancel it. "
+    "If asked what sound plays, say 'a chime' and do not name files."
 )
 
 
@@ -61,6 +64,8 @@ class Config:
     temperature: float = 0.7
     max_history_messages: int = 40
     forget_history: bool = True  # if true, forget previous user/assistant turns after each reply
+    preserve_history: bool = False  # if true, keep history and compact after 30 messages
+    compact_after: int = 30  # when preserve_history is true, compact when turns exceed this
 
     whisper_model: str = "base.en"
 
@@ -120,15 +125,25 @@ def load_config() -> Config:
         "You are a helpful voice assistant. Keep answers concise and conversational, in plain "
         "spoken language with no lists or markdown. Address the user directly."
     )
+    _old_with_lithium = "The Lithium sound will loop 5 times when it rings"
     if "system_prompt" in raw and isinstance(raw["system_prompt"], str):
-        if raw["system_prompt"].strip() == _old_prompt.strip():
+        sp = raw["system_prompt"].strip()
+        if sp == _old_prompt.strip() or _old_with_lithium in sp:
             raw["system_prompt"] = DEFAULT_SYSTEM_PROMPT
     cfg = Config(**{k: v for k, v in raw.items() if k in known})
     cfg.llm_model = _norm_model_id(cfg.llm_model)
     if cfg.llm_api_key.strip() in ("vocalis-local", "ollama", "lm-studio", "unsloth", "none"):
         cfg.llm_api_key = ""
-    if cfg.system_prompt.strip() == _old_prompt.strip():
+    if cfg.system_prompt.strip() == _old_prompt.strip() or _old_with_lithium in cfg.system_prompt:
         cfg.system_prompt = DEFAULT_SYSTEM_PROMPT
+    # preserve_history is new — if user had forget_history=False, keep preserved history by default
+    if "preserve_history" not in raw and cfg.forget_history is False:
+        cfg.preserve_history = True
+    # sanity: compact_after
+    if cfg.compact_after < 10:
+        cfg.compact_after = 30
+    if cfg.compact_after > cfg.max_history_messages:
+        cfg.compact_after = max(10, cfg.max_history_messages - 10)
     # One-time migration: old bug caused continuous listening to leave mic hot after speaking.
     # If the file still has True from that era and the version hasn't opted-in explicitly,
     # force back to False once. User can re-enable via Settings.

@@ -161,7 +161,7 @@ class Sounds:
             self._playback.put(self._lithium)
 
     def play_timer_loop(self, loops: int = 5, gap_ms: int = 200) -> None:
-        """Play Lithium `loops` times with small gaps, cancellable via stop_timer_loop()."""
+        """Play timer alarm `loops` times with small gaps, cancellable via stop_timer_loop()."""
         self._timer_stop.clear()
         def _run():
             log.info("Timer loop start: %d loops", loops)

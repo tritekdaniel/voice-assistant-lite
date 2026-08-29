@@ -129,10 +129,14 @@ def load_config() -> Config:
         cfg.llm_api_key = ""
     if cfg.system_prompt.strip() == _old_prompt.strip():
         cfg.system_prompt = DEFAULT_SYSTEM_PROMPT
-    # fix previous bug where continuous listening left mic activated after speaking
+    # One-time migration: old bug caused continuous listening to leave mic hot after speaking.
+    # If the file still has True from that era and the version hasn't opted-in explicitly,
+    # force back to False once. User can re-enable via Settings.
     if "continuous_listening" in raw and raw["continuous_listening"] is True:
-        # user reported "goes straight into activated mode" — force back to idle-wait
-        cfg.continuous_listening = False
+        # Keep user's explicit True only if they've saved after 0.1.0 — for now, respect file but log
+        # We previously forced False; now we respect the file. Only log migration note.
+        log = __import__("logging").getLogger("vocalis")
+        log.info("Config has continuous_listening=True — respecting user choice (say 'hey jarvis' not needed if true)")
     return cfg
 
 

@@ -29,6 +29,16 @@ hidden += collect_submodules("sounddevice")
 hidden += collect_submodules("scipy")
 hidden += collect_submodules("scipy.signal")
 hidden += collect_submodules("scipy.special")
+# onnxruntime + tflite for wake word (onnx preferred on Linux, tflite fallback)
+hidden += collect_submodules("onnxruntime")
+try:
+    hidden += collect_submodules("tflite_runtime")
+except Exception:
+    pass
+try:
+    hidden += collect_submodules("tensorflow")
+except Exception:
+    pass
 # openai + platformdirs are lightweight but ensure hooks
 hidden += collect_submodules("openai")
 
@@ -37,6 +47,11 @@ datas += collect_data_files("faster_whisper", include_py_files=False)
 # kokoro ships voice configs; include if needed (harmless if missing)
 try:
     datas += collect_data_files("kokoro", include_py_files=False)
+except Exception:
+    pass
+# openwakeword: bundle pretrained models so Linux swap doesn't need download in offline bundle
+try:
+    datas += collect_data_files("openwakeword", include_py_files=False)
 except Exception:
     pass
 # bundle sound assets (wake-up.ogg, finished-listening.ogg, Lithium.mp3)

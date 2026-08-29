@@ -563,13 +563,17 @@ class SettingsDialog(QDialog):
         self._wake = QComboBox()
         self._wake.setEditable(True)
         self._wake.addItems(WAKE_CHOICES)
-        # cfg.wake_word may be a path
-        if cfg.wake_word in WAKE_CHOICES:
-            self._wake.setCurrentText(cfg.wake_word)
+        # cfg.wake_word may be a path — show basename or full path; handle file vs preset
+        cur_wake = (cfg.wake_word or "hey_jarvis").strip()
+        if cur_wake in WAKE_CHOICES:
+            self._wake.setCurrentText(cur_wake)
         else:
-            self._wake.setCurrentText(cfg.wake_word)
+            # Custom path — ensure it's visible even though editable combo only has presets
+            if self._wake.findText(cur_wake) == -1:
+                self._wake.addItem(cur_wake)
+            self._wake.setCurrentText(cur_wake)
         form3.addRow("Wake word", self._wake)
-        self._btn_wake_browse = QPushButton("Browse .onnx…")
+        self._btn_wake_browse = QPushButton("Browse .onnx / .tflite…")
         self._btn_wake_browse.clicked.connect(self._browse_wake)
         form3.addRow("", self._btn_wake_browse)
 
@@ -668,6 +672,7 @@ class SettingsDialog(QDialog):
 
         # Preset -> fill handling
         self._preset.currentTextChanged.connect(self._apply_preset)
+        self._preset.currentTextChanged.connect(lambda _: self._refresh_models())
         self._base_url.editingFinished.connect(lambda: self._lbl_models.setText("Base URL changed — click Refresh to reload models"))
         # auto-fetch once on open (provider dropdown)
         if self._base_url.text().strip():
@@ -790,8 +795,11 @@ class SettingsDialog(QDialog):
             self._api_key.setText(key)
 
     def _browse_wake(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Choose wake-word .onnx", "", "ONNX (*.onnx);;All files (*.*)")
+        path, _ = QFileDialog.getOpenFileName(self, "Choose wake-word model", "", "Wake word (*.onnx *.tflite);;ONNX (*.onnx);;TFLite (*.tflite);;All files (*.*)")
         if path:
+            # If combo doesn't contain this path, add it so it persists
+            if self._wake.findText(path) == -1:
+                self._wake.addItem(path)
             self._wake.setCurrentText(path)
 
     def _browse_emb(self) -> None:
@@ -1037,7 +1045,8 @@ class SettingsDialog(QDialog):
         c = self.cfg
         c.llm_base_url = self._base_url.text().strip() or c.llm_base_url
         c.llm_model = self._model_id() or c.llm_model
-        c.llm_api_key = self._api_key.text().strip() or c.llm_api_key
+        # Allow clearing API key (empty is valid for local providers)
+        c.llm_api_key = self._api_key.text().strip()
         c.temperature = float(self._temp.value())
         c.system_prompt = self._sys.toPlainText().strip() or c.system_prompt
         # voice/whisper store pure id (from data or split display)

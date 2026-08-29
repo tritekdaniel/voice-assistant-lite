@@ -120,8 +120,8 @@ class Playback:
     def start(self) -> None:
         if self._thread.is_alive():
             return
-        # Thread objects are one-shot; recreate if already used
-        if self._thread._started.is_set():  # type: ignore[attr-defined]
+        # Thread objects are one-shot; recreate if already used. Check ident (set after first start) instead of private _started.
+        if self._thread.ident is not None:
             self._thread = threading.Thread(target=self._run, daemon=True)
         try:
             self._thread.start()

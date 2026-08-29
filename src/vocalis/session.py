@@ -154,12 +154,28 @@ class Session:
                 self._sounds.preload()
             except Exception as e:
                 log.warning("Sounds preload failed: %s", e)
+        # Try selected device, then fallback to default (fixes PortAudio Device unavailable on Linux after device change)
         try:
             self._audio_in.start()
             log.info("AudioIn started on device=%s", getattr(self._audio_in, "_device", None))
         except Exception as e:
-            log.exception("AudioIn start failed: %s", e)
-            self.listener.error(f"Microphone failed: {e} — check Settings -> audio device")
+            if getattr(self._audio_in, "_device", None) is not None and "Device unavailable" in str(e):
+                log.warning("Selected input device %s unavailable, retrying with default", self._audio_in._device)
+                try:
+                    self._audio_in._device = None  # type: ignore[attr-defined]
+                    # need to re-create stream with None - stop first if partially started
+                    try:
+                        self._audio_in.stop()
+                    except Exception:
+                        pass
+                    self._audio_in.start()
+                    log.info("AudioIn started on fallback default device")
+                except Exception as e2:
+                    log.exception("AudioIn fallback also failed: %s", e2)
+                    self.listener.error(f"Microphone failed: {e2} — check Settings -> audio device")
+            else:
+                log.exception("AudioIn start failed: %s", e)
+                self.listener.error(f"Microphone failed: {e} — check Settings -> audio device")
         self._wake_thread = threading.Thread(target=self._wake_loop, daemon=True, name="wake")
         self._wake_thread.start()
         log.debug("Wake thread started")
@@ -229,10 +245,10 @@ class Session:
 
     # -- wake word thread ---------------------------------------------------
 
-    _warned_wakeword = False
-
     def _wake_loop(self) -> None:
         log.debug("Wake loop started")
+        warned = False
+        consecutive = 0
         while not self._stop.is_set():
             try:
                 frame = self._wake_frames.get(timeout=0.25)
@@ -240,11 +256,17 @@ class Session:
                 continue
             try:
                 fired = self._wakeword.trigger(frame)
+                consecutive = 0  # reset on success
             except BaseException as e:  # noqa: BLE001
-                log.exception("Wake word trigger failed: %s", e)
-                if not self._warned_wakeword:
-                    self._warned_wakeword = True
-                    self.listener.error(f"Wake word error: {e}")
+                consecutive += 1
+                # Log first error at exception, then every 50th to avoid spam (was every 80ms)
+                if consecutive == 1:
+                    log.exception("Wake word trigger failed: %s", e)
+                    self.listener.error(f"Wake word error: {e} — check Settings -> Wake word (log: {__import__('pathlib').Path(__import__('vocalis.config', fromlist=['data_dir']).data_dir()) / 'logs' / 'vocalis.log'})")
+                elif consecutive % 50 == 0:
+                    log.warning("Wake word still failing (%d times): %s", consecutive, e)
+                # Back off a bit to avoid hot loop when model is broken
+                time.sleep(0.5 if consecutive < 10 else 1.0)
                 continue
             if fired:
                 log.info("Wake word detected (state=%s)", self.state.value)

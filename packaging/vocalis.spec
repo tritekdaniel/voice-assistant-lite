@@ -51,9 +51,18 @@ try:
     datas += collect_data_files("kokoro", include_py_files=False)
 except Exception:
     pass
-# openwakeword: bundle pretrained models so Linux swap doesn't need download in offline bundle
+# openwakeword: bundle pretrained models + feature models (melspectrogram, embedding, VAD)
+# so custom wake words work in frozen builds without extra downloads
 try:
     datas += collect_data_files("openwakeword", include_py_files=False)
+except Exception:
+    pass
+# Explicitly include openwakeword resources/models folder (collect_data_files may miss some)
+try:
+    import openwakeword
+    ow_resources = Path(openwakeword.__file__).parent / "resources"
+    if ow_resources.exists():
+        datas.append((str(ow_resources), "openwakeword/resources"))
 except Exception:
     pass
 # bundle sound assets (wake-up.ogg, finished-listening.ogg, Lithium.mp3)

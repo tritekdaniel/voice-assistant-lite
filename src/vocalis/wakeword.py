@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import time
 from pathlib import Path
 
@@ -117,22 +118,28 @@ class WakeWord:
             return
         log.info("Loading wake word model %r (threshold %.2f, cooldown %dms)", self._spec, self.threshold, int(self._cooldown_s*1000))
         import openwakeword.model as om
+        import openwakeword
 
         # Resolve to explicit file if possible (writable dir, handles frozen)
         p = Path(self._spec).expanduser()
         is_file = p.exists() and p.suffix.lower() in (".onnx", ".tflite")
         if is_file:
             model_ref = str(p)
-            # Ensure melspectrogram/embedding are available in writable dir as well (needed for custom)
+            # Ensure feature models (melspectrogram, embedding, VAD) are available in writable dir.
+            # openwakeword Model class loads these from package resources; in frozen builds with custom
+            # models outside the bundle, it may not find them. Download to writable dir and also try
+            # to patch the package resource path so Model can find them.
             try:
                 wdir = _writable_model_dir()
-                # download_models ensures feature models exist
                 from openwakeword.utils import download_models
-                # If feature models missing, download
-                if not (wdir / "melspectrogram.tflite").exists() or not (wdir / "embedding_model.tflite").exists():
-                    download_models(target_directory=str(wdir))
-            except Exception:
-                pass
+                # Always ensure feature models exist in writable dir
+                download_models(target_directory=str(wdir))
+                # Also try to make openwakeword use writable dir for feature models by patching
+                # the resource path function if in frozen mode
+                if getattr(sys, "frozen", False):
+                    _patch_openwakeword_resources(wdir)
+            except Exception as e:
+                log.warning("Failed to ensure feature models for custom wake word: %s", e)
         else:
             # Pretrained name — resolve to file in writable dir
             resolved = _resolve_pretrained_path(self._spec, prefer_onnx=True)
@@ -210,6 +217,44 @@ class WakeWord:
                 tried.append(f"{kwargs} -> {e}")
                 continue
         raise RuntimeError(f"Could not init wake word model {self._spec!r} (resolved {model_ref!r}) with {tried}")
+
+
+def _patch_openwakeword_resources(writable_dir: Path) -> None:
+    """Monkey-patch openwakeword to use writable_dir for feature models in frozen builds."""
+    try:
+        import openwakeword
+        import openwakeword.utils as ow_utils
+        # Patch get_pretrained_model_paths to prefer writable_dir for feature models
+        orig_get_paths = openwakeword.get_pretrained_model_paths
+
+        def patched_get_paths(framework: str = "tflite"):
+            # Get original paths
+            paths = orig_get_paths(framework)
+            # For feature models (melspectrogram, embedding, VAD), prefer writable_dir
+            feature_names = ["melspectrogram", "embedding_model", "silero_vad"]
+            patched = []
+            for path in paths:
+                name = Path(path).stem
+                if any(fn in name for fn in feature_names):
+                    # Check writable dir first
+                    for ext in (f".{framework}", ".onnx", ".tflite"):
+                        wp = writable_dir / f"{name}{ext}"
+                        if wp.exists():
+                            patched.append(str(wp))
+                            break
+                    else:
+                        patched.append(path)
+                else:
+                    patched.append(path)
+            return patched
+
+        openwakeword.get_pretrained_model_paths = patched_get_paths
+        # Also patch the module where Model imports it
+        if hasattr(ow_utils, "get_pretrained_model_paths"):
+            ow_utils.get_pretrained_model_paths = patched_get_paths
+        log.debug("Patched openwakeword.get_pretrained_model_paths to use writable dir %s", writable_dir)
+    except Exception as e:
+        log.debug("Failed to patch openwakeword resources: %s", e)
 
     def score(self, chunk_int16: np.ndarray) -> float:
         self.ensure_loaded()

@@ -1,10 +1,31 @@
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
+
+# --- SciPy 1.13+ workaround: stats import can hang on some systems ---
+# This must run BEFORE any import of openwakeword/sklearn/scipy
+try:
+    # Monkey-patch scipy.stats._distribution_infrastructure._generate_example
+    # to avoid the hang in entropy calculation at import time
+    import scipy.stats._distribution_infrastructure as _di
+    _orig_generate_example = _di._generate_example
+    def _safe_generate_example(self):
+        try:
+            return _orig_generate_example(self)
+        except Exception:
+            return "Example unavailable (scipy workaround)"
+    _di._generate_example = _safe_generate_example
+except Exception:
+    # If scipy not yet imported or patch fails, continue anyway
+    pass
+
+# Also set env var to encourage scipy to use simpler code paths
+os.environ.setdefault("SCIPY_USE_PROPAGATE", "1")
 
 from .logger import get_logger
 
@@ -100,6 +121,44 @@ def _resolve_pretrained_path(name: str, prefer_onnx: bool = True) -> Path | None
     return None
 
 
+def _patch_openwakeword_resources(writable_dir: Path) -> None:
+    """Monkey-patch openwakeword to use writable_dir for feature models in frozen builds."""
+    try:
+        import openwakeword
+        import openwakeword.utils as ow_utils
+        # Patch get_pretrained_model_paths to prefer writable_dir for feature models
+        orig_get_paths = openwakeword.get_pretrained_model_paths
+
+        def patched_get_paths(framework: str = "tflite"):
+            # Get original paths
+            paths = orig_get_paths(framework)
+            # For feature models (melspectrogram, embedding, VAD), prefer writable_dir
+            feature_names = ["melspectrogram", "embedding_model", "silero_vad"]
+            patched = []
+            for path in paths:
+                name = Path(path).stem
+                if any(fn in name for fn in feature_names):
+                    # Check writable dir first
+                    for ext in (f".{framework}", ".onnx", ".tflite"):
+                        wp = writable_dir / f"{name}{ext}"
+                        if wp.exists():
+                            patched.append(str(wp))
+                            break
+                    else:
+                        patched.append(path)
+                else:
+                    patched.append(path)
+            return patched
+
+        openwakeword.get_pretrained_model_paths = patched_get_paths
+        # Also patch the module where Model imports it
+        if hasattr(ow_utils, "get_pretrained_model_paths"):
+            ow_utils.get_pretrained_model_paths = patched_get_paths
+        log.debug("Patched openwakeword.get_pretrained_model_paths to use writable dir %s", writable_dir)
+    except Exception as e:
+        log.debug("Failed to patch openwakeword resources: %s", e)
+
+
 class WakeWord:
     """openwakeword wrapper with trigger threshold + cooldown policy. Handles Linux frozen + onnx/tflite."""
 
@@ -117,29 +176,23 @@ class WakeWord:
         if self._model is not None:
             return
         log.info("Loading wake word model %r (threshold %.2f, cooldown %dms)", self._spec, self.threshold, int(self._cooldown_s*1000))
+        # Ensure feature models are available BEFORE importing openwakeword.model
+        # because Model class may load them at import time
+        wdir = _writable_model_dir()
+        self._ensure_feature_models(wdir)
+
         import openwakeword.model as om
         import openwakeword
+
+        # Also patch resource paths for frozen builds BEFORE Model is used
+        if getattr(sys, "frozen", False):
+            _patch_openwakeword_resources(wdir)
 
         # Resolve to explicit file if possible (writable dir, handles frozen)
         p = Path(self._spec).expanduser()
         is_file = p.exists() and p.suffix.lower() in (".onnx", ".tflite")
         if is_file:
             model_ref = str(p)
-            # Ensure feature models (melspectrogram, embedding, VAD) are available in writable dir.
-            # openwakeword Model class loads these from package resources; in frozen builds with custom
-            # models outside the bundle, it may not find them. Download to writable dir and also try
-            # to patch the package resource path so Model can find them.
-            try:
-                wdir = _writable_model_dir()
-                from openwakeword.utils import download_models
-                # Always ensure feature models exist in writable dir
-                download_models(target_directory=str(wdir))
-                # Also try to make openwakeword use writable dir for feature models by patching
-                # the resource path function if in frozen mode
-                if getattr(sys, "frozen", False):
-                    _patch_openwakeword_resources(wdir)
-            except Exception as e:
-                log.warning("Failed to ensure feature models for custom wake word: %s", e)
         else:
             # Pretrained name — resolve to file in writable dir
             resolved = _resolve_pretrained_path(self._spec, prefer_onnx=True)
@@ -218,43 +271,30 @@ class WakeWord:
                 continue
         raise RuntimeError(f"Could not init wake word model {self._spec!r} (resolved {model_ref!r}) with {tried}")
 
-
-def _patch_openwakeword_resources(writable_dir: Path) -> None:
-    """Monkey-patch openwakeword to use writable_dir for feature models in frozen builds."""
-    try:
-        import openwakeword
-        import openwakeword.utils as ow_utils
-        # Patch get_pretrained_model_paths to prefer writable_dir for feature models
-        orig_get_paths = openwakeword.get_pretrained_model_paths
-
-        def patched_get_paths(framework: str = "tflite"):
-            # Get original paths
-            paths = orig_get_paths(framework)
-            # For feature models (melspectrogram, embedding, VAD), prefer writable_dir
-            feature_names = ["melspectrogram", "embedding_model", "silero_vad"]
-            patched = []
-            for path in paths:
-                name = Path(path).stem
-                if any(fn in name for fn in feature_names):
-                    # Check writable dir first
-                    for ext in (f".{framework}", ".onnx", ".tflite"):
-                        wp = writable_dir / f"{name}{ext}"
-                        if wp.exists():
-                            patched.append(str(wp))
-                            break
-                    else:
-                        patched.append(path)
-                else:
-                    patched.append(path)
-            return patched
-
-        openwakeword.get_pretrained_model_paths = patched_get_paths
-        # Also patch the module where Model imports it
-        if hasattr(ow_utils, "get_pretrained_model_paths"):
-            ow_utils.get_pretrained_model_paths = patched_get_paths
-        log.debug("Patched openwakeword.get_pretrained_model_paths to use writable dir %s", writable_dir)
-    except Exception as e:
-        log.debug("Failed to patch openwakeword resources: %s", e)
+    def _ensure_feature_models(self, wdir: Path) -> None:
+        """Download/copy feature models (melspectrogram, embedding, VAD) to writable dir."""
+        try:
+            from openwakeword.utils import download_models
+            # This downloads all feature models + pretrained models to wdir
+            download_models(target_directory=str(wdir))
+            log.debug("Feature models ensured in %s", wdir)
+        except Exception as e:
+            log.warning("Could not download feature models to %s: %s", wdir, e)
+            # Try to copy from package resources as fallback
+            try:
+                import openwakeword
+                pkg_dir = Path(openwakeword.__file__).parent / "resources" / "models"
+                feature_names = ["melspectrogram", "embedding_model", "silero_vad"]
+                for name in feature_names:
+                    for ext in (".onnx", ".tflite"):
+                        src = pkg_dir / f"{name}{ext}"
+                        dst = wdir / f"{name}{ext}"
+                        if src.exists() and not dst.exists():
+                            import shutil
+                            shutil.copy2(src, dst)
+                            log.debug("Copied %s from package resources", src.name)
+            except Exception as e2:
+                log.debug("Fallback copy also failed: %s", e2)
 
     def score(self, chunk_int16: np.ndarray) -> float:
         self.ensure_loaded()

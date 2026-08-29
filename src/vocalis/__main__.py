@@ -159,6 +159,10 @@ def _run_check(cfg) -> int:
                       cfg.wakeword_cooldown_ms, cfg.wakeword_embeddings)
         score = ww.score(np.zeros(1280, dtype=np.int16))
         line("wake word", True, f"model '{cfg.wake_word}' loaded (silent score {score:.3f})")
+    except KeyboardInterrupt:
+        ok = False
+        print("[fail] wake word - scipy import hang detected (known issue on some systems)")
+        print("       Try: export SCIPY_USE_PROPAGATE=1  or  use venv mode without --check")
     except Exception as e:  # noqa: BLE001
         ok = False
         print(f"[fail] wake word - {e}")

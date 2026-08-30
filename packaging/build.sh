@@ -6,7 +6,16 @@ PY="$VENV/bin/python"
 if [ ! -x "$PY" ]; then PY="python3.11"; fi
 echo "Building standalone Vocalis binary (PyInstaller)..."
 if [[ "${1:-}" == "--clean" ]]; then rm -rf "$ROOT/build" "$ROOT/dist"; fi
-# OOM guard — lean spec can still peak 8GB with kokoro+whisper; 32GB can still OOM if piper included
+# Linux desktop-kick guard: PyInstaller even lean can take the session down (strip, fork, pulse).
+# Default to venv-only on Linux; require --force to build.
+if grep -q "Linux" /proc/version 2>/dev/null; then
+  if [[ "${1:-}" != "--force" && "${2:-}" != "--force" ]]; then
+    echo "Linux: not building PyInstaller binary by default (previous builds kicked desktop to login on 32GB)."
+    echo "Use venv: .venv/bin/vocalis  — or force: bash packaging/build.sh --force"
+    exit 0
+  fi
+fi
+# OOM guard — lean spec can still peak 8GB with kokoro+whisper
 _avail_kb=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
 _avail_mb=$((_avail_kb / 1024))
 if [ "$_avail_mb" -gt 0 ] && [ "$_avail_mb" -lt 8000 ]; then

@@ -24,12 +24,18 @@ if [ -z "$PY" ]; then
 fi
 
 # 2. System deps — auto-install PortAudio/scipy prereqs on Debian/Ubuntu
-if command -v apt-get >/dev/null 2>&1; then
+# Never auto-run apt on Linux without --with-apt (it can restart audio/display and kick the user to login)
+_with_apt=0
+for a in "$@"; do case "$a" in --with-apt) _with_apt=1;; esac; done
+if [ "$_with_apt" -eq 1 ] && command -v apt-get >/dev/null 2>&1; then
   if ! dpkg -l | grep -q "portaudio19-dev" 2>/dev/null; then
     echo "Installing system deps: portaudio19-dev, libportaudio2, python3.11-venv (needs sudo)..."
     sudo apt-get update && sudo apt-get install -y portaudio19-dev libportaudio2 python3.11-venv || echo "apt install failed — please run manually: sudo apt install portaudio19-dev libportaudio2"
   fi
-  # Also ensure scipy system deps are present (openwakeword needs it)
+elif command -v apt-get >/dev/null 2>&1; then
+  if ! dpkg -l | grep -q "portaudio19-dev" 2>/dev/null; then
+    echo "Note: portaudio19-dev not found — needed for mic. Install with: sudo apt install portaudio19-dev libportaudio2  or  bash scripts/install.sh --with-apt"
+  fi
   if ! python3 -c "import scipy" 2>/dev/null; then
     echo "Note: scipy will be pip-installed with vocalis (openwakeword needs it)"
   fi
@@ -84,11 +90,24 @@ for a in "$@"; do case "$a" in --with-piper)
 esac; done
 # Never auto-install piper on Linux without --with-piper — it crashes 32GB on source build
 
-# 6. standalone binary (preferred) — skip with --no-binary
-# Linux OOM guard: PyInstaller Analysis with kokoro+whisper+piper can peak >8GB and OOM-kill even on 32GB.
-# Check RAM and be lean; always fall back to venv on failure (don't crash host).
+# 6. standalone binary — on Linux, never build by default (it previously kicked the user to login).
+# PyInstaller with kokoro+whisper can still take the desktop down even on 32GB (strip/UPX/fork).
+# Use venv mode by default on Linux; build only if --with-binary is explicitly passed.
 BINARY="$ROOT/dist/Vocalis/Vocalis"
 _should_build=1
+# On Linux, default to venv-only to avoid desktop kick (user reported back-to-login on 32GB)
+_is_linux=0
+if grep -q "Linux" /proc/version 2>/dev/null; then _is_linux=1; fi
+if [ "$_is_linux" -eq 1 ] && [ "$NO_BINARY" -eq 0 ]; then
+  _has_with_binary=0
+  for a in "$@"; do case "$a" in --with-binary) _has_with_binary=1;; esac; done
+  if [ "$_has_with_binary" -eq 0 ]; then
+    echo ""
+    echo "Linux: skipping PyInstaller binary by default (previous builds kicked desktop to login on 32GB)."
+    echo "Using venv mode (same features, no build, no kick). To build binary: bash scripts/install.sh --with-binary"
+    _should_build=0
+  fi
+fi
 if [ "$NO_BINARY" -ne 0 ]; then
   _should_build=0
 else
@@ -97,7 +116,6 @@ else
   if [ "$_force" -eq 0 ] && [ -f /proc/meminfo ]; then
     _avail_kb=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
     _avail_mb=$((_avail_kb / 1024))
-    # Even 32GB can OOM with full hiddenimports (kokoro+piper+whisper). Warn if <8GB available, and skip piper in binary.
     if [ "$_avail_mb" -gt 0 ] && [ "$_avail_mb" -lt 8000 ]; then
       echo ""
       echo "Low RAM detected (${_avail_mb} MB available) — PyInstaller binary is RAM-heavy (kokoro+piper+whisper)"
@@ -105,7 +123,6 @@ else
       echo "To force: bash scripts/install.sh --with-binary  or use --no-binary then build manually"
       _should_build=0
     fi
-    # Also check swap
     _swap_kb=$(awk '/SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
     if [ "$_swap_kb" -eq 0 ] && [ "$_avail_mb" -lt 16000 ]; then
       echo "No swap and ${_avail_mb}MB RAM — binary build may still OOM-kill. Will try but fallback to venv on failure."

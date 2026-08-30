@@ -167,7 +167,7 @@ exe = EXE(
     name="Vocalis",
     debug=False,
     bootloader_ignore_signals=False,
-    strip=True if _is_linux else False,
+    strip=False,  # never strip on Linux (can crash display/coredump); Windows ok but keep False for safety
     upx=_use_upx,
     console=False,
     icon=icon,
@@ -180,7 +180,7 @@ coll = COLLECT(
     a.binaries,
     a.zipfiles,
     a.datas,
-    strip=True if _is_linux else False,
+    strip=False,
     upx=_use_upx,
     name="Vocalis",
 )

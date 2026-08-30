@@ -65,9 +65,24 @@ if ! "$PIP" install --no-cache-dir -e "$ROOT" --upgrade; then
     exit 1
   }
 fi
-# Optional: piper voices (heavy, 34MB + build). Install only if requested or already present.
-for a in "$@"; do case "$a" in --with-piper) echo "Installing piper voices (--with-piper) ..."; "$PIP" install --no-cache-dir -e "$ROOT[piper]" --upgrade || echo "piper install failed — kokoro will still work"; break;; esac; done
-# If pip extra piper was already requested via existing venv, keep it; otherwise skip to save RAM
+# Optional: piper voices (heavy, 34MB + native build). Linux often has no wheel -> source build OOMs 32GB and crashes.
+# Install only if requested, never crash host, and never build from source on Linux.
+for a in "$@"; do case "$a" in --with-piper)
+  echo "Installing piper voices (--with-piper) ..."
+  if grep -q "Linux" /proc/version 2>/dev/null; then
+    echo "Linux: piper install is binary-only (source build OOMs). Trying --only-binary..."
+    if "$PIP" install --no-cache-dir --only-binary=:all: -e "$ROOT[piper]" --upgrade 2>&1 | tail -20; then
+      echo "piper installed (binary)"
+    else
+      echo "piper binary not available for this Linux/Python — skipping piper (kokoro will still work)."
+      echo "Tip: use kokoro (default) or build piper manually: pip install --no-build-isolation piper-tts"
+    fi
+  else
+    "$PIP" install --no-cache-dir -e "$ROOT[piper]" --upgrade || echo "piper install failed — kokoro will still work"
+  fi
+  break;;
+esac; done
+# Never auto-install piper on Linux without --with-piper — it crashes 32GB on source build
 
 # 6. standalone binary (preferred) — skip with --no-binary
 # Linux OOM guard: PyInstaller Analysis with kokoro+whisper+piper can peak >8GB and OOM-kill even on 32GB.

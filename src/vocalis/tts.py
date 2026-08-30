@@ -247,9 +247,31 @@ class PiperSpeaker:
 
 
 def create_speaker(cfg) -> Speaker | PiperSpeaker:
-    """Factory: return Kokoro Speaker or PiperSpeaker based on cfg.tts_engine."""
-    engine = getattr(cfg, "tts_engine", "kokoro")
-    if str(engine).lower() == "piper":
+    """Factory: return Kokoro Speaker or PiperSpeaker based on cfg.tts_engine.
+
+    On Linux, Piper is venv-only and may not be installed; if piper model missing or
+    piper-tts not installed, fall back to Kokoro so install/check never crashes.
+    """
+    engine = str(getattr(cfg, "tts_engine", "kokoro")).lower()
+    if engine == "piper":
+        model = (getattr(cfg, "piper_model", "") or "").strip()
+        # If no model configured, fall back to kokoro (don't crash)
+        if not model:
+            log.warning("TTS engine piper selected but piper_model is empty — falling back to kokoro")
+            engine = "kokoro"
+        else:
+            # Check piper is importable and model exists before returning PiperSpeaker
+            try:
+                import importlib.util
+                if importlib.util.find_spec("piper") is None:
+                    raise ImportError("piper not installed")
+                from pathlib import Path
+                if not Path(model).expanduser().exists():
+                    raise FileNotFoundError(f"piper model not found: {model}")
+            except Exception as e:
+                log.warning("Piper not available (%s) — falling back to kokoro", e)
+                engine = "kokoro"
+    if engine == "piper":
         return PiperSpeaker(
             model_path=getattr(cfg, "piper_model", ""),
             config_path=getattr(cfg, "piper_config", ""),

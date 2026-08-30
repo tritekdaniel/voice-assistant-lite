@@ -22,56 +22,77 @@ icon = ICON_ICO if Path(ICON_ICO).exists() else (ICON_PNG if Path(ICON_PNG).exis
 block_cipher = None
 
 hidden = []
-# Keep hiddenimports lean — collecting all of scipy/torch/tensorflow OOMs Linux (32GB still crashed).
-# Let PyInstaller discover via entry.py; only add what it misses.
-# Heavy packages (kokoro/piper) are explicit, not full collect_submodules.
-try:
-    hidden += collect_submodules("faster_whisper", filter=lambda name: "test" not in name and "model" not in name)
-except Exception:
-    hidden += ["faster_whisper"]
-try:
-    hidden += collect_submodules("openwakeword", filter=lambda name: "test" not in name)
-except Exception:
-    hidden += ["openwakeword"]
-# kokoro/piper/sounddevice: explicit, not full tree (kokoro pulls torch; piper pulls espeak)
-hidden += ["kokoro", "kokoro.pipeline", "kokoro.model"]
-hidden += ["sounddevice"]
-# piper is optional (pip install -e .[piper]); include only if installed to keep base binary lean
+# Keep hiddenimports lean — collecting all of torch/scipy/faster_whisper OOMs Linux even on 32GB.
+# Let PyInstaller discover via entry.py; only add what it misses. On Linux, be extra lean.
+import sys as _sys_hidden
+_is_linux_hidden = _sys_hidden.platform.startswith("linux")
+if _is_linux_hidden:
+    # Linux: minimal hiddenimports; PyInstaller will walk entry.py imports. Avoid collecting
+    # heavy trees (faster_whisper/openwakeword/kokoro) which peak 6-8GB and OOM-kill.
+    hidden += ["faster_whisper", "openwakeword", "kokoro", "sounddevice"]
+else:
+    try:
+        hidden += collect_submodules("faster_whisper", filter=lambda name: "test" not in name and "model" not in name)
+    except Exception:
+        hidden += ["faster_whisper"]
+    try:
+        hidden += collect_submodules("openwakeword", filter=lambda name: "test" not in name)
+    except Exception:
+        hidden += ["openwakeword"]
+    # kokoro/piper/sounddevice: explicit, not full tree (kokoro pulls torch; piper pulls espeak)
+    hidden += ["kokoro", "kokoro.pipeline", "kokoro.model"]
+    hidden += ["sounddevice"]
+# piper is optional (pip install -e .[piper]); keep binary lean — never include piper on Linux
+# (Linux piper install often needs --only-binary and can OOM during Analysis; venv mode handles piper fine)
+_is_linux_spec = __import__("sys").platform.startswith("linux")
 try:
     import importlib.util
-    if importlib.util.find_spec("piper") is not None:
+    if not _is_linux_spec and importlib.util.find_spec("piper") is not None:
         hidden += ["piper", "piper.voice", "piper.config", "piper.phonemize_espeak"]
-        # don't collect all piper submodules on low-RAM; just the core
         try:
             hidden += collect_submodules("piper", filter=lambda n: n in ("piper.voice", "piper.config"))
         except Exception:
             pass
+    elif _is_linux_spec and importlib.util.find_spec("piper") is not None:
+        # On Linux, piper stays venv-only; binary uses kokoro to avoid 32GB OOM
+        pass
 except Exception:
     pass
 # scipy: only the bits openwakeword actually uses (signal/special), not the whole 200-module tree
-for _m in ("scipy.signal", "scipy.special", "scipy.linalg", "scipy.spatial"):
-    try:
-        hidden += collect_submodules(_m)
-    except Exception:
-        pass
+if _is_linux_hidden:
+    hidden += ["scipy.signal", "scipy.special"]
+else:
+    for _m in ("scipy.signal", "scipy.special", "scipy.linalg", "scipy.spatial"):
+        try:
+            hidden += collect_submodules(_m)
+        except Exception:
+            pass
 # onnxruntime for wake word — onnx only, no tflite required
-hidden += collect_submodules("onnxruntime", filter=lambda n: "test" not in n and "tools" not in n)
+if _is_linux_hidden:
+    hidden += ["onnxruntime"]
+else:
+    hidden += collect_submodules("onnxruntime", filter=lambda n: "test" not in n and "tools" not in n)
 # openai is lightweight
 hidden += ["openai", "openai.resources", "openai.types"]
 
 datas = []
-datas += collect_data_files("faster_whisper", include_py_files=False)
-# kokoro ships voice configs; include if needed (harmless if missing)
-try:
-    datas += collect_data_files("kokoro", include_py_files=False)
-except Exception:
+if _is_linux_hidden:
+    # Linux lean: models download at runtime (~700MB), don't bundle to keep binary small and avoid OOM
+    # Only bundle what is needed for offline wake word if already present
     pass
-# openwakeword: bundle pretrained models + feature models (melspectrogram, embedding, VAD)
-# so custom wake words work in frozen builds without extra downloads
-try:
-    datas += collect_data_files("openwakeword", include_py_files=False)
-except Exception:
-    pass
+else:
+    datas += collect_data_files("faster_whisper", include_py_files=False)
+    # kokoro ships voice configs; include if needed (harmless if missing)
+    try:
+        datas += collect_data_files("kokoro", include_py_files=False)
+    except Exception:
+        pass
+    # openwakeword: bundle pretrained models + feature models (melspectrogram, embedding, VAD)
+    # so custom wake words work in frozen builds without extra downloads
+    try:
+        datas += collect_data_files("openwakeword", include_py_files=False)
+    except Exception:
+        pass
 # Explicitly include openwakeword resources/models folder (collect_data_files may miss some)
 try:
     import openwakeword
@@ -94,10 +115,11 @@ try:
     datas += collect_data_files("soundfile", include_py_files=False)
 except Exception:
     pass
-# piper espeak-ng data and voices (needed for Piper TTS) — only if piper installed
+# piper espeak-ng data and voices (needed for Piper TTS) — never in Linux binary (venv-only)
 try:
     import importlib.util
-    if importlib.util.find_spec("piper") is not None:
+    _is_linux_data = __import__("sys").platform.startswith("linux")
+    if not _is_linux_data and importlib.util.find_spec("piper") is not None:
         datas += collect_data_files("piper", include_py_files=False)
 except Exception:
     pass

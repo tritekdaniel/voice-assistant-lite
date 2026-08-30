@@ -239,46 +239,44 @@ class PiperSpeaker:
                 except Exception:
                     pass
                 if c is None:
-                    # Try Hugging Face download if model looks like a piper-voices name (en_US-*, etc.)
+                    # For custom voices like glados, HF won't have it — don't spam download attempts.
+                    # Just list what was found and give a clear next step.
                     try:
-                        from huggingface_hub import hf_hub_download
-                        import re
-                        stem = m.stem  # e.g. en_US-glados-medium
-                        # Only auto-download for known piper-voices pattern
-                        if re.match(r"^[a-z]{2}_[A-Z]{2}-", stem):
-                            log.info("Piper json not found for %s — trying Hugging Face download...", m.name)
-                            # Try common piper-voices repo
-                            for repo in ["rhasspy/piper-voices", "rhasspy/piper-voices"]:
-                                try:
-                                    # Guess voice path: lang/lang_REGION/name/medium/model.onnx.json
-                                    # For glados custom, this will fail and we fall through
-                                    parts = stem.split("-")
-                                    # Try direct filename
-                                    fname = f"{stem}.onnx.json"
-                                    # Search via hf_hub
-                                    dl = hf_hub_download(repo_id=repo, filename=f"en/en_US/glados/medium/{fname}", local_dir=str(parent))
-                                    dl_p = Path(dl)
-                                    if dl_p.exists() and self._is_valid_piper_config(dl_p):
-                                        c = dl_p
-                                        log.info("Downloaded piper config %s", dl_p)
-                                        break
-                                except Exception as e:
-                                    log.debug("HF download try failed for %s: %s", stem, e)
-                                    continue
+                        parent = m.parent
+                        found = []
+                        if parent.exists():
+                            for cand in parent.glob("*.json"):
+                                valid = self._is_valid_piper_config(cand)
+                                found.append(f"{cand.name} ({'valid' if valid else 'invalid, missing num_symbols'})")
+                        log.warning(
+                            "No valid piper .json for %s (tried %s and %s). Found in %s: [%s]. "
+                            "Copy the matching %s.json next to %s (download from same source as the .onnx).",
+                            m.name, cj.name, alt.name, parent, ", ".join(found) if found else "none", m.name, m.name,
+                        )
                     except Exception:
-                        pass
-                if c is None:
-                    log.warning("No sibling .json found for %s (tried %s and %s) and no valid piper json in %s", m, cj, alt, m.parent)
+                        log.warning("No sibling .json found for %s (tried %s and %s) and no valid piper json in %s", m, cj, alt, m.parent)
         return m, c
 
     def ensure_loaded(self) -> None:
         m, c = self._resolve_paths()
         if c is None or not c.exists() or not self._is_valid_piper_config(c):
-            # Last chance: c is None or invalid — raise with helpful message instead of cryptic FileNotFound inside piper
+            # Build helpful listing
+            try:
+                parent = m.parent
+                found = []
+                if parent.exists():
+                    for cand in parent.glob("*.json"):
+                        valid = self._is_valid_piper_config(cand)
+                        found.append(f"{cand.name}={'valid' if valid else 'invalid'}")
+                listing = ", ".join(found) if found else "none"
+            except Exception:
+                listing = "unknown"
             raise FileNotFoundError(
-                f"Piper model {m} needs a matching .json config (tried {m}.json and {m.with_suffix('.json')}). "
-                f"Download the .onnx.json for this voice from the same source as the .onnx (e.g. rhasspy/piper-voices) "
-                f"and place it next to the .onnx. Searched {m.parent} and found no valid piper json."
+                f"Piper model {m.name} needs a matching .json (tried {m.name}.json and {m.with_suffix('.json').name}). "
+                f"Found in {m.parent}: [{listing}]. "
+                f"For {m.name}, download its .onnx.json from the same place you got the .onnx "
+                f"(e.g. for en_US-glados-medium, the .onnx.json with num_symbols) and put it next to the .onnx. "
+                f"Leave Piper config empty in Settings to auto-find it."
             )
         key = f"{m}|{c}|{self.speaker_id}"
         cached = _PIPER_CACHE.get(key)

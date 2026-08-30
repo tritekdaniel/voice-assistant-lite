@@ -71,10 +71,13 @@ class UtteranceBuffer:
         speech = rms_dbfs(frame_int16) > self._thr
         if not self._started:
             if speech:
-                self._parts.extend(list(self._preroll))
+                preroll = list(self._preroll)
+                self._parts.extend(preroll)
                 self._parts.append(frame_int16)
                 self._started = True
                 self.silence_ms = 0.0
+                # count preroll + first speech frame in active_ms
+                self.active_ms = len(preroll) * FRAME_MS + FRAME_MS
             else:
                 self._preroll.append(frame_int16)
             if speech:
@@ -200,8 +203,10 @@ class Session:
         except BaseException as e:
             log.critical("Session run crashed: %s", e, exc_info=True)
             self.listener.error(f"Session crashed: {e} — see log {__import__('pathlib').Path(__import__('vocalis.config', fromlist=['data_dir']).data_dir()) / 'logs' / 'vocalis.log'}")
+            self._stop.set()
             raise
         finally:
+            self._stop.set()
             log.info("Session run loop exited")
 
     def stop(self) -> None:
@@ -397,11 +402,12 @@ class Session:
     def _flush_utterance(self) -> None:
         audio = self._utt.audio_f32()
         self._utt.reset()
-        # reset grace once we got an utterance
-        self._grace_until = None
         if len(audio) < int(16000 * 0.2):
             log.debug("Utterance too short (%.2fs), ignoring", len(audio)/16000)
+            # keep grace window open for follow-up attempts
             return
+        # reset grace once we got a valid utterance
+        self._grace_until = None
         log.info("STT transcribe %.2fs audio", len(audio)/16000)
         try:
             text = self._stt.transcribe(audio)
@@ -477,7 +483,11 @@ class Session:
                     if self._stop.is_set() or self._cancel.is_set():
                         cancelled = True
                         break
+                    if cancelled:
+                        break
                     self._speak_sentence(sent)
+                if cancelled:
+                    break
         except BaseException as e:  # noqa: BLE001
             log.exception("LLM failed: %s", e)
             self.listener.error(f"LLM failed: {e} — is the server at {self.cfg.llm_base_url} running?")

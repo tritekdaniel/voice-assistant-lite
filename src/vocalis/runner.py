@@ -52,6 +52,10 @@ def run_headless(cfg: Config) -> None:
     t.start()
     try:
         while not session.stopped:
+            if not t.is_alive():
+                log.critical("Session thread died unexpectedly — exiting headless loop")
+                print("[error] Session crashed — see log for details")
+                break
             time.sleep(0.2)
     except KeyboardInterrupt:
         log.info("Headless KeyboardInterrupt")

@@ -29,8 +29,8 @@ class SentenceBuffer:
 
     def flush(self) -> str | None:
         rem = self._buf[self._start:].strip()
-        self._start = len(self._buf)
         self._buf = ""
+        self._start = 0
         return rem or None
 
     # -- internals ---------------------------------------------------------

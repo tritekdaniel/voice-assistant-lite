@@ -3,10 +3,12 @@ from __future__ import annotations
 import numpy as np
 
 from .logger import get_logger
+import threading
 
 log = get_logger(__name__)
 
 _cache: dict[str, object] = {}
+_cache_lock = threading.Lock()
 
 
 class Transcriber:
@@ -23,16 +25,23 @@ class Transcriber:
     def ensure_loaded(self) -> None:
         if self._model is not None:
             return
-        log.info("Loading Whisper model %r (cpu int8)", self._name)
-        from faster_whisper import WhisperModel
+        with _cache_lock:
+            if self._model is not None:
+                return
+            cached = _cache.get(self._name)
+            if cached is not None:
+                self._model = cached  # type: ignore
+                return
+            log.info("Loading Whisper model %r (cpu int8)", self._name)
+            from faster_whisper import WhisperModel
 
-        try:
-            self._model = WhisperModel(self._name, device="cpu", compute_type="int8")
-            _cache[self._name] = self._model
-            log.info("Whisper %r ready", self._name)
-        except BaseException as e:
-            log.exception("Whisper load failed %r: %s", self._name, e)
-            raise
+            try:
+                self._model = WhisperModel(self._name, device="cpu", compute_type="int8")
+                _cache[self._name] = self._model
+                log.info("Whisper %r ready", self._name)
+            except BaseException as e:
+                log.exception("Whisper load failed %r: %s", self._name, e)
+                raise
 
     def transcribe(self, audio_f32_16k: np.ndarray) -> str:
         self.ensure_loaded()

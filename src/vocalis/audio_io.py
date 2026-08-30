@@ -20,11 +20,13 @@ class AudioIn:
 
     def __init__(self, device: int | None = None):
         self._subs: list[queue.Queue] = []
+        self._subs_lock = threading.Lock()
         self._stream = None
         self._device = device
 
     def add_subscriber(self, q: queue.Queue) -> None:
-        self._subs.append(q)
+        with self._subs_lock:
+            self._subs.append(q)
 
     def start(self) -> None:
         import sounddevice as sd
@@ -68,9 +70,11 @@ class AudioIn:
                 # Never raise from callback — would become CFFI "Exception ignored"
                 log.exception("AudioIn callback failed: %s", e)
                 return
-            for q in self._subs:
+            with self._subs_lock:
+                subs = list(self._subs)
+            for q in subs:
                 try:
-                    q.put(data)
+                    q.put(data.copy())
                 except Exception:
                     pass
 
@@ -141,14 +145,16 @@ class Playback:
             self._q.put(a[i:i + PLAY_CHUNK_SAMPLES].copy())
 
     def cancel(self) -> None:
+        self._cancel.set()
         while True:
             try:
                 self._q.get_nowait()
             except queue.Empty:
                 break
-        self._cancel.set()
 
     def idle(self) -> bool:
+        # Use lock-free but consistent check: _writing is only written by _run thread
+        # and read here; GIL ensures atomic bool read/write.
         return self._q.empty() and not self._writing
 
     def stop(self) -> None:
@@ -177,12 +183,24 @@ class Playback:
                 continue
             self._ensure_stream()
             if self._stream is None:
+                # stream failed — re-queue chunk with backoff instead of dropping
+                try:
+                    self._q.put(chunk)
+                except Exception:
+                    pass
+                import time as _time
+                _time.sleep(0.2)
                 continue
             self._writing = True
             try:
                 self._stream.write(chunk)
             except Exception:
-                pass
+                # on write failure, re-queue and retry
+                try:
+                    if not self._closed.is_set() and not self._cancel.is_set():
+                        self._q.put(chunk)
+                except Exception:
+                    pass
             finally:
                 self._writing = False
 

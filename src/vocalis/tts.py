@@ -10,6 +10,8 @@ from .logger import get_logger
 log = get_logger(__name__)
 
 _cache: dict[str, object] = {}
+_cache_lock = __import__("threading").Lock()
+_piper_lock = __import__("threading").Lock()
 
 
 def _resample_to_out_rate(data: np.ndarray, sr_in: int, sr_out: int = 24000) -> np.ndarray:
@@ -54,18 +56,23 @@ class Speaker:
             cached_lang = _cache.get("kokoro_lang")
             if cached_lang == lang:
                 return
-        from kokoro import KPipeline
+        with _cache_lock:
+            if self._pipe is not None:
+                lang2 = self._lang_for_voice(self.voice)
+                if _cache.get("kokoro_lang") == lang2:
+                    return
+            from kokoro import KPipeline
 
-        lang = self._lang_for_voice(self.voice)
-        log.info("Loading Kokoro pipeline lang=%r voice=%r", lang, self.voice)
-        try:
-            self._pipe = KPipeline(lang_code=lang)
-            log.info("Kokoro ready lang=%r", lang)
-        except BaseException as e:
-            log.exception("Kokoro load failed lang=%r: %s", lang, e)
-            raise
-        _cache["kokoro"] = self._pipe
-        _cache["kokoro_lang"] = lang
+            lang = self._lang_for_voice(self.voice)
+            log.info("Loading Kokoro pipeline lang=%r voice=%r", lang, self.voice)
+            try:
+                self._pipe = KPipeline(lang_code=lang)
+                log.info("Kokoro ready lang=%r", lang)
+            except BaseException as e:
+                log.exception("Kokoro load failed lang=%r: %s", lang, e)
+                raise
+            _cache["kokoro"] = self._pipe
+            _cache["kokoro_lang"] = lang
 
     def synthesize(self, text: str) -> np.ndarray:
         self.ensure_loaded()
@@ -278,7 +285,7 @@ class PiperSpeaker:
                 f"(e.g. for en_US-glados-medium, the .onnx.json with num_symbols) and put it next to the .onnx. "
                 f"Leave Piper config empty in Settings to auto-find it."
             )
-        key = f"{m}|{c}|{self.speaker_id}"
+        key = f"{m}|{c}|{self.speaker_id}|{self.length_scale}|{self.noise_scale}|{self.noise_w}"
         cached = _PIPER_CACHE.get(key)
         if cached is not None and self._voice is not None:
             return
@@ -321,7 +328,7 @@ class PiperSpeaker:
             except (KeyError, ValueError, FileNotFoundError) as e:
                 last_exc = e
                 # Config mismatch like 'num_symbols' — try next candidate
-                if cand is not None and "num_symbols" in str(e) or isinstance(e, KeyError):
+                if (cand is not None and "num_symbols" in str(e)) or isinstance(e, KeyError):
                     log.warning("Piper load with config %s failed (%s) — trying fallback", cand, e)
                     continue
                 # For other errors, don't retry

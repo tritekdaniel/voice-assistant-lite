@@ -27,11 +27,16 @@ def log_path() -> Path:
 def setup_logging(level: str = "INFO", also_console: bool = False) -> logging.Logger:
     global _logger, _log_path, _file_handler
 
-    if _logger is not None:
-        return _logger
-
-    # Normalize level
     lvl = getattr(logging, level.upper(), logging.INFO)
+    if _logger is not None:
+        # allow --log-level updates
+        _logger.setLevel(lvl)
+        for h in _logger.handlers:
+            try:
+                h.setLevel(lvl if isinstance(h, logging.handlers.RotatingFileHandler) else (lvl if also_console or _is_headless_env() else logging.WARNING))
+            except Exception:
+                pass
+        return _logger
 
     logger = logging.getLogger(LOG_NAME)
     logger.setLevel(lvl)
@@ -40,6 +45,10 @@ def setup_logging(level: str = "INFO", also_console: bool = False) -> logging.Lo
     # Clear old handlers if any
     for h in list(logger.handlers):
         logger.removeHandler(h)
+        try:
+            h.close()
+        except Exception:
+            pass
 
     fmt = logging.Formatter(
         "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
@@ -132,7 +141,7 @@ def reveal_in_file_manager(path: Path | None = None) -> None:
         target = logs_dir()
     try:
         if sys.platform.startswith("win"):
-            subprocess.Popen(f'explorer "{target}"')  # type: ignore
+            subprocess.Popen(["explorer", str(target)])  # type: ignore
         elif sys.platform == "darwin":
             subprocess.Popen(["open", str(target)])
         else:

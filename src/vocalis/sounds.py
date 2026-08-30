@@ -116,21 +116,8 @@ class Sounds:
         self._timer_thread: threading.Thread | None = None
 
     def preload(self) -> None:
-        # Load in background thread to not block UI, but also allow sync preload
-        def _load():
-            try:
-                self._wake = _load_asset("wake-up.ogg")
-                self._finished = _load_asset("finished-listening.ogg")
-                self._lithium = _load_asset("Lithium.mp3")
-                self._timer_set = _load_asset("timer-set.mp3")
-                log.info("Sounds preloaded: wake %d, finished %d, lithium %d, timer_set %d samples", len(self._wake), len(self._finished), len(self._lithium), len(self._timer_set))
-            except Exception as e:
-                log.exception("Sounds preload failed: %s", e)
-        t = threading.Thread(target=_load, daemon=True, name="sounds-preload")
-        t.start()
-        # also try sync for immediate use if needed
+        # Load synchronously first for immediate use, then background refresh
         if len(self._wake) == 0:
-            # quick sync fallback for first wake
             try:
                 self._wake = _load_asset("wake-up.ogg")
             except Exception:
@@ -140,6 +127,29 @@ class Sounds:
                 self._timer_set = _load_asset("timer-set.mp3")
             except Exception:
                 pass
+        def _load():
+            try:
+                with self._lock:
+                    # re-check to avoid overwriting with zeros if already loaded
+                    pass
+                w = _load_asset("wake-up.ogg")
+                f = _load_asset("finished-listening.ogg")
+                l = _load_asset("Lithium.mp3")
+                ts = _load_asset("timer-set.mp3")
+                with self._lock:
+                    if len(w):
+                        self._wake = w
+                    if len(f):
+                        self._finished = f
+                    if len(l):
+                        self._lithium = l
+                    if len(ts):
+                        self._timer_set = ts
+                log.info("Sounds preloaded: wake %d, finished %d, lithium %d, timer_set %d samples", len(self._wake), len(self._finished), len(self._lithium), len(self._timer_set))
+            except Exception as e:
+                log.exception("Sounds preload failed: %s", e)
+        t = threading.Thread(target=_load, daemon=True, name="sounds-preload")
+        t.start()
 
     def ensure_loaded(self) -> None:
         if len(self._wake) == 0:
@@ -179,35 +189,54 @@ class Sounds:
 
     def play_timer_loop(self, loops: int = 5, gap_ms: int = 200) -> None:
         """Play timer alarm `loops` times with small gaps, cancellable via stop_timer_loop()."""
-        self._timer_stop.clear()
-        def _run():
+        with self._lock:
+            # stop any existing loop before starting a new one
+            if self._timer_thread is not None and self._timer_thread.is_alive():
+                self._timer_stop.set()
+                # don't join while holding lock to avoid deadlock; release briefly
+                t_old = self._timer_thread
+            else:
+                t_old = None
+            self._timer_stop.clear()
+            stop_evt = self._timer_stop
+        if t_old is not None:
+            try:
+                t_old.join(timeout=0.5)
+            except Exception:
+                pass
+        def _run(stop=stop_evt):
             log.info("Timer loop start: %d loops", loops)
             for i in range(loops):
-                if self._timer_stop.is_set():
+                if stop.is_set():
                     log.info("Timer loop cancelled at %d/%d", i, loops)
                     break
                 self.play_lithium_once()
-                # wait for sound duration + gap, but cancellable
                 dur = len(self._lithium) / OUT_RATE if len(self._lithium) else 1.0
                 wait = dur + gap_ms / 1000.0
-                # sleep in small increments to allow quick cancel
                 end = __import__("time").monotonic() + wait
                 while __import__("time").monotonic() < end:
-                    if self._timer_stop.is_set():
+                    if stop.is_set():
                         break
                     __import__("time").sleep(0.05)
             log.info("Timer loop done")
-        self._timer_thread = threading.Thread(target=_run, daemon=True, name="timer-loop")
-        self._timer_thread.start()
+        with self._lock:
+            self._timer_thread = threading.Thread(target=_run, daemon=True, name="timer-loop")
+            self._timer_thread.start()
 
     def stop_timer_loop(self) -> None:
+        with self._lock:
+            t = self._timer_thread
         self._timer_stop.set()
-        # also cancel any queued timer audio — but don't cancel all TTS if possible
-        # For now, cancel all playback (timer is distinctive, user expects stop to be immediate)
+        # cancel queued timer audio — but wake new non-timer TTS will still play after
         try:
             self._playback.cancel()
         except Exception:
             pass
+        if t is not None and t.is_alive():
+            try:
+                t.join(timeout=1.0)
+            except Exception:
+                pass
         log.info("Timer loop stop requested")
 
     @property

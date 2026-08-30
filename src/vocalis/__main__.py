@@ -37,10 +37,11 @@ def _apply_flags(args, cfg) -> None:
         if v is None:
             return None
         s = v.strip().lstrip("/\\").strip()
-        # keep namespace like unsloth/ but basename gguf
-        if "\\" in s or ("/" in s and s.count("/") > 1 and ":" not in s):
-            if s.lower().endswith((".gguf", ".bin", ".onnx")):
+        if s.lower().endswith((".gguf", ".bin", ".onnx")):
+            if "\\" in s:
                 s = s.replace("\\", "/").split("/")[-1]
+            elif "/" in s and ":" not in s:
+                s = s.split("/")[-1]
         return s
     mapping = {
         "llm_base_url": args.base_url,

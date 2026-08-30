@@ -152,12 +152,13 @@ class TimerManager:
                 stopped = True
             except Exception:
                 pass
-        # also stop any currently playing alarm loop
-        try:
-            self._sounds.stop_timer_loop()
-            stopped = True
-        except Exception:
-            pass
+        # only stop alarm loop if we actually cancelled something or a loop is active
+        if to_cancel or self._sounds.is_timer_active:
+            try:
+                self._sounds.stop_timer_loop()
+                stopped = True
+            except Exception:
+                pass
         if to_cancel:
             log.info("Timer cancelled: %s", ", ".join(f"#{e.tid} {e.label} {e.duration}s" for e in to_cancel))
             if len(to_cancel) == 1:

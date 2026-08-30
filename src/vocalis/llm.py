@@ -41,38 +41,46 @@ class History:
         keep = keep if keep is not None else self._compact_after
         if len(self._turns) <= keep:
             return None
-        # Older turns to compact
         older = self._turns[:-keep]
         recent = self._turns[-keep:]
-        # Build a deterministic compact summary (no LLM call — keeps it offline/fast).
-        # Summarize as: last N turns + key facts.
         lines: list[str] = []
-        for m in older[-12:]:  # last 12 of the older chunk to avoid huge summary
+        for m in older[-12:]:
             role = m.get("role", "?")
             content = (m.get("content") or "").strip().replace("\n", " ")
             if len(content) > 140:
                 content = content[:137] + "..."
             if content:
                 lines.append(f"{role}: {content}")
-        summary = (
-            f"[Conversation so far — {len(older)} earlier messages compacted. "
-            f"Recent context kept: {len(recent)} messages. Key excerpts: "
-            + " | ".join(lines)
-            + "]"
-        )
+        new_part = " | ".join(lines)
+        if self._summary:
+            # accumulate, don't overwrite history older than window
+            summary = self._summary + " | " + new_part if new_part else self._summary
+            # trim summary to avoid unbounded growth
+            if len(summary) > 2000:
+                summary = summary[-2000:]
+        else:
+            summary = (
+                f"[Conversation so far — {len(older)} earlier messages compacted. "
+                f"Recent context kept: {len(recent)} messages. Key excerpts: "
+                + new_part
+                + "]"
+            )
         self._summary = summary
         self._turns = recent
         log.debug("History compacted: %d -> %d turns (compact_after=%d)", len(older)+len(recent), len(recent), self._compact_after)
         return summary
 
     def _trim(self) -> None:
-        # Compact when we exceed compact_after (preserve mode), otherwise trim to max
-        if len(self._turns) > self._compact_after:
-            # Keep at most compact_after messages; compact older ones into summary
+        # Only compact when we exceed both compact_after and max; prefer trimming to max
+        if len(self._turns) > self._max:
+            # If we would lose too much, compact first to preserve summary
+            if len(self._turns) > self._compact_after:
+                self.compact(keep=self._compact_after)
+            overflow = len(self._turns) - self._max
+            if overflow > 0:
+                del self._turns[:overflow]
+        elif len(self._turns) > self._compact_after:
             self.compact(keep=self._compact_after)
-        overflow = len(self._turns) - self._max
-        if overflow > 0:
-            del self._turns[:overflow]
 
 
 def _is_placeholder_key(k: str) -> bool:
@@ -155,15 +163,7 @@ class LLMClient:
             log.debug("LM Studio ensure-loaded skipped/failed: %s", e)
         return False
 
-    def stream_reply(self, messages: list[dict], tools: list[dict] | None = None) -> Iterator[str]:
-        # LM Studio: ensure selected model is loaded before the prompt (auto-evict/TTL may have unloaded it)
-        # Do this once per turn, before the chat request, so the prompt doesn't fail with 404/model_not_loaded
-        try:
-            self._ensure_lmstudio_model_loaded()
-        except Exception:
-            pass
-        # tools for timer, etc. Stored for caller to inspect after stream
-        self._pending_tool_calls: list[dict] = []
+    def _stream_once(self, messages: list[dict], tools: list[dict] | None, tool_calls: dict[int, dict]) -> Iterator[str]:
         kwargs: dict = {
             "model": self.model,
             "messages": messages,
@@ -173,61 +173,114 @@ class LLMClient:
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+        with self._client.chat.completions.create(**kwargs) as stream:  # type: ignore[arg-type]
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta  # type: ignore[attr-defined]
+                content = getattr(delta, "content", None)
+                if content:
+                    log.debug("LLM delta: %r", content[:80])
+                    yield content
+                tcs = getattr(delta, "tool_calls", None)
+                if tcs:
+                    for tc in tcs:
+                        idx = getattr(tc, "index", 0)
+                        if idx not in tool_calls:
+                            tool_calls[idx] = {"id": getattr(tc, "id", f"call_{idx}"), "type": "function", "function": {"name": "", "arguments": ""}}
+                        fn = getattr(tc, "function", None)
+                        if fn:
+                            if getattr(fn, "name", None):
+                                tool_calls[idx]["function"]["name"] = fn.name  # type: ignore
+                            if getattr(fn, "arguments", None):
+                                tool_calls[idx]["function"]["arguments"] += fn.arguments  # type: ignore
+
+    def _stream_fallback_httpx(self, messages: list[dict]) -> Iterator[str]:
+        """Fallback streaming via raw httpx without auth (for 401 placeholder case)."""
+        import httpx
+        import json
+
+        url = str(self._client.base_url).rstrip("/") + "/chat/completions"
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "stream": True,
+        }
+        self._pending_tool_calls = []
+        with httpx.Client(timeout=None) as c:
+            with c.stream("POST", url, json=payload, headers={"Content-Type": "application/json"}) as r:
+                r.raise_for_status()
+                for line in r.iter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data)
+                        delta = obj.get("choices", [{}])[0].get("delta", {})
+                        content = delta.get("content")
+                        if content:
+                            yield content
+                    except Exception:
+                        continue
+
+    def stream_reply(self, messages: list[dict], tools: list[dict] | None = None) -> Iterator[str]:
+        try:
+            self._ensure_lmstudio_model_loaded()
+        except Exception:
+            pass
+        self._pending_tool_calls: list[dict] = []
         log.info("LLM stream start model=%s msgs=%d tools=%s", self.model, len(messages), bool(tools))
         tool_calls: dict[int, dict] = {}
-        try:
-            with self._client.chat.completions.create(**kwargs) as stream:  # type: ignore[arg-type]
-                for chunk in stream:
-                    if not chunk.choices:
-                        continue
-                    delta = chunk.choices[0].delta  # type: ignore[attr-defined]
-                    # content
-                    content = getattr(delta, "content", None)
-                    if content:
-                        log.debug("LLM delta: %r", content[:80])
-                        yield content
-                    # tool calls (streaming)
-                    tcs = getattr(delta, "tool_calls", None)
-                    if tcs:
-                        for tc in tcs:
-                            idx = getattr(tc, "index", 0)
-                            if idx not in tool_calls:
-                                tool_calls[idx] = {"id": getattr(tc, "id", f"call_{idx}"), "type": "function", "function": {"name": "", "arguments": ""}}
-                            fn = getattr(tc, "function", None)
-                            if fn:
-                                if getattr(fn, "name", None):
-                                    tool_calls[idx]["function"]["name"] = fn.name  # type: ignore
-                                if getattr(fn, "arguments", None):
-                                    tool_calls[idx]["function"]["arguments"] += fn.arguments  # type: ignore
-            if tool_calls:
-                self._pending_tool_calls = list(tool_calls.values())
-                log.info("LLM tool calls collected: %s", self._pending_tool_calls)
-            else:
-                self._pending_tool_calls = []
-            log.info("LLM stream done")
-        except BaseException as e:
-            msg = str(e).lower()
-            # If model was evicted (LM Studio TTL) the chat may 404. Try one load+retry.
-            if any(s in msg for s in ("model not found", "model not loaded", "model_not_loaded", "no model loaded", "failed to load model", "404")):
-                log.warning("LLM stream failed with model-not-loaded, trying ensure-loaded + retry: %s", e)
-                try:
-                    if self._ensure_lmstudio_model_loaded(timeout=90.0):
-                        # retry once without recursion on tools
-                        for chunk in self.stream_reply(messages, tools=tools):
-                            yield chunk
-                        return
-                except Exception as re:
-                    log.debug("Retry after load also failed: %s", re)
-            # If tools not supported, retry without tools
-            if tools and ("tools" in str(e).lower() or "tool" in str(e).lower()):
-                log.warning("LLM tools not supported, retrying without tools: %s", e)
-                self._pending_tool_calls = []
-                # retry without tools
-                for chunk in self.stream_reply(messages, tools=None):
-                    yield chunk
+        cur_tools = tools
+        for attempt in range(3):
+            try:
+                yield from self._stream_once(messages, cur_tools, tool_calls)
+                if tool_calls:
+                    self._pending_tool_calls = list(tool_calls.values())
+                    log.info("LLM tool calls collected: %s", self._pending_tool_calls)
+                else:
+                    self._pending_tool_calls = []
+                log.info("LLM stream done")
                 return
-            log.exception("LLM stream failed base_url=%s model=%s: %s", self._client.base_url, self.model, e)
-            raise
+            except BaseException as e:
+                msg = str(e).lower()
+                msg_raw = str(e)
+                is_model_err = any(s in msg for s in ("model not found", "model not loaded", "model_not_loaded", "no model loaded", "failed to load model", "404"))
+                is_auth_err = "401" in msg_raw or "authentication" in msg or "invalid token" in msg
+                is_tool_err = cur_tools and ("tools" in msg or "tool" in msg)
+
+                if is_model_err and attempt == 0:
+                    log.warning("LLM stream model-not-loaded, trying ensure-loaded + retry: %s", e)
+                    try:
+                        if self._ensure_lmstudio_model_loaded(timeout=90.0):
+                            continue
+                    except Exception as re:
+                        log.debug("Retry after load also failed: %s", re)
+
+                if is_auth_err and self._is_placeholder and attempt == 0:
+                    log.warning("LLM stream 401 with placeholder key — retrying without auth via httpx")
+                    try:
+                        # stream without tools via fallback (tools not supported in fallback)
+                        yield from self._stream_fallback_httpx(messages)
+                        log.info("LLM stream fallback done")
+                        return
+                    except Exception as fe:
+                        log.debug("Fallback stream also failed: %s", fe)
+
+                if is_tool_err and cur_tools is not None:
+                    log.warning("LLM tools not supported, retrying without tools: %s", e)
+                    self._pending_tool_calls = []
+                    cur_tools = None
+                    tool_calls.clear()
+                    continue
+
+                log.exception("LLM stream failed base_url=%s model=%s: %s", self._client.base_url, self.model, e)
+                raise
+        log.error("LLM stream exhausted retries")
+        return
 
     @property
     def pending_tool_calls(self) -> list[dict]:

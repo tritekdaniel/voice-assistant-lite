@@ -884,6 +884,26 @@ class SettingsDialog(QDialog):
         if path:
             self._wake_emb.setText(path)
 
+    def _safe_emit(self, signal, *args) -> None:
+        try:
+            import sip
+            if sip.isdeleted(self):
+                return
+        except Exception:
+            pass
+        try:
+            if not self.isVisible() and signal in (self._test_signals.sig_llm, self._test_signals.sig_tts, self._test_signals.sig_models_ok, self._test_signals.sig_models_err, self._test_signals.sig_wake, self._test_signals.sig_wake_done):
+                # dialog already closed — don't emit to deleted QObject
+                from PySide6.QtWidgets import QApplication
+                if not self.isVisible() and QApplication.instance() is None:
+                    return
+            signal.emit(*args)
+        except RuntimeError:
+            pass
+
+    def _prune_workers(self) -> None:
+        self._workers = [t for t in self._workers if t.is_alive()]
+
     def _do_test_llm(self) -> None:
         self._btn_test_llm.setEnabled(False)
         self._lbl_llm.setText("Testing…")
@@ -897,12 +917,13 @@ class SettingsDialog(QDialog):
                 from .llm import LLMClient
                 c = LLMClient(url, model, key, temp)
                 r = c.check()
-                self._test_signals.sig_llm.emit(f"OK — replied: {r[:60]}")
+                self._safe_emit(self._test_signals.sig_llm, f"OK — replied: {r[:60]}")
             except Exception as e:
-                self._test_signals.sig_llm.emit(f"Failed: {e}")
+                self._safe_emit(self._test_signals.sig_llm, f"Failed: {e}")
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
+        self._prune_workers()
         self._workers.append(t)
 
     def _on_llm_result(self, text: str) -> None:
@@ -935,12 +956,13 @@ class SettingsDialog(QDialog):
                 from .llm import LLMClient
                 c = LLMClient(url, cur or "test", key)
                 ids = c.list_models()
-                self._test_signals.sig_models_ok.emit(ids)
+                self._safe_emit(self._test_signals.sig_models_ok, ids)
             except Exception as e:
-                self._test_signals.sig_models_err.emit(str(e))
+                self._safe_emit(self._test_signals.sig_models_err, str(e))
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
+        self._prune_workers()
         self._workers.append(t)
 
     def _on_models_ok(self, models: object) -> None:
@@ -1036,7 +1058,7 @@ class SettingsDialog(QDialog):
                 spk = _make_spk()
                 audio = spk.synthesize("This is how I sound.")
                 if len(audio) == 0:
-                    self._test_signals.sig_tts.emit("No audio produced")
+                    self._safe_emit(self._test_signals.sig_tts, "No audio produced")
                     return
                 pb = Playback(device=out_dev)
                 pb.start()
@@ -1046,12 +1068,13 @@ class SettingsDialog(QDialog):
                         break
                     time.sleep(0.1)
                 pb.stop()
-                self._test_signals.sig_tts.emit(f"Played {len(audio)/24000:.1f}s on {voice_label} ({engine})")
+                self._safe_emit(self._test_signals.sig_tts, f"Played {len(audio)/24000:.1f}s on {voice_label} ({engine})")
             except Exception as e:
-                self._test_signals.sig_tts.emit(f"Failed: {e}")
+                self._safe_emit(self._test_signals.sig_tts, f"Failed: {e}")
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
+        self._prune_workers()
         self._workers.append(t)
 
     def _do_wake_test(self) -> None:
@@ -1088,14 +1111,15 @@ class SettingsDialog(QDialog):
                     if ww.should_trigger(s):
                         triggers += 1
                     # throttle UI a bit
-                    self._test_signals.sig_wake.emit(f"score {s:.2f} (peak {peak:.2f}) — triggers {triggers}")
+                    self._safe_emit(self._test_signals.sig_wake, f"score {s:.2f} (peak {peak:.2f}) — triggers {triggers}")
                 ai.stop()
-                self._test_signals.sig_wake_done.emit(f"Done — peak {peak:.2f}, triggers {triggers} in 8s")
+                self._safe_emit(self._test_signals.sig_wake_done, f"Done — peak {peak:.2f}, triggers {triggers} in 8s")
             except Exception as e:
-                self._test_signals.sig_wake_done.emit(f"Wake test failed: {e}")
+                self._safe_emit(self._test_signals.sig_wake_done, f"Wake test failed: {e}")
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
+        self._prune_workers()
         self._workers.append(t)
 
     def _view_log_settings(self) -> None:

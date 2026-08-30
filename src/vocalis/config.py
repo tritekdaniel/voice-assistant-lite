@@ -128,7 +128,14 @@ def load_config() -> Config:
         return Config()
     try:
         raw = tomllib.loads(p.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as e:
+        import logging
+        logging.getLogger("vocalis").warning("Corrupt config.toml at %s (%s) — using defaults, backing up", p, e)
+        try:
+            bak = p.with_suffix(".toml.bak")
+            p.rename(bak)
+        except Exception:
+            pass
         return Config()
     known = {f.name for f in dataclasses.fields(Config)}
     # normalize model id that may have been saved with leading slash from old provider paths
@@ -169,11 +176,15 @@ def load_config() -> Config:
     # preserve_history is new — if user had forget_history=False, keep preserved history by default
     if "preserve_history" not in raw and cfg.forget_history is False:
         cfg.preserve_history = True
-    # sanity: compact_after
-    if cfg.compact_after < 10:
-        cfg.compact_after = 30
-    if cfg.compact_after > cfg.max_history_messages:
-        cfg.compact_after = max(10, cfg.max_history_messages - 10)
+    # sanity: compact_after must be < max_history; normally 10-100
+    cfg.compact_after = min(cfg.compact_after, 100)
+    cfg.compact_after = min(cfg.compact_after, cfg.max_history_messages - 1)
+    if cfg.max_history_messages >= 11:
+        if cfg.compact_after < 10:
+            cfg.compact_after = min(30, cfg.max_history_messages - 1)
+        cfg.compact_after = max(10, cfg.compact_after)
+    else:
+        cfg.compact_after = max(1, cfg.compact_after)
     # One-time migration: old bug caused continuous listening to leave mic hot after speaking.
     # If the file still has True from that era and the version hasn't opted-in explicitly,
     # force back to False once. User can re-enable via Settings.
@@ -183,9 +194,9 @@ def load_config() -> Config:
         log = __import__("logging").getLogger("vocalis")
         log.info("Config has continuous_listening=True — respecting user choice (say 'hey jarvis' not needed if true)")
     # TTS engine sanity + piper defaults
+    cfg.tts_engine = cfg.tts_engine.strip().lower()
     if cfg.tts_engine not in ("kokoro", "piper"):
         cfg.tts_engine = "kokoro"
-    cfg.tts_engine = cfg.tts_engine.strip().lower()
     # normalize piper paths
     if cfg.piper_model:
         cfg.piper_model = cfg.piper_model.strip()

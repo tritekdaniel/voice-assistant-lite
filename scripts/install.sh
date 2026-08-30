@@ -44,52 +44,76 @@ else
 fi
 PIP="$VENV/bin/pip"
 PYV="$VENV/bin/python"
-"$PYV" -m pip install --upgrade pip
+# Use --no-cache-dir and single process to keep RAM low on 32GB (pip cache can spike 2-3GB with torch)
+"$PYV" -m pip install --upgrade pip --no-cache-dir || "$PYV" -m pip install --upgrade pip
 
-# 4. torch CPU first
+# 4. torch CPU first (lean, no cache, handle OOM)
 echo "Installing torch (CPU-only) ..."
-"$PIP" install --index-url https://download.pytorch.org/whl/cpu torch --upgrade
+if ! "$PIP" install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch --upgrade; then
+  echo "torch install failed (possible OOM or network). Retrying without cache and with --no-deps fallback..."
+  "$PIP" install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch --no-deps --upgrade || {
+    echo "ERROR: torch CPU install failed. See logs. Continuing to try vocalis install (may fail)..."
+  }
+fi
 
-# 5. vocalis
+# 5. vocalis (base, no piper by default to keep RAM lean)
 echo "Installing vocalis (pip install -e .) ..."
-"$PIP" install -e "$ROOT" --upgrade
+if ! "$PIP" install --no-cache-dir -e "$ROOT" --upgrade; then
+  echo "pip install -e . failed — retrying with --no-build-isolation (saves RAM)..."
+  "$PIP" install --no-cache-dir --no-build-isolation -e "$ROOT" --upgrade || {
+    echo "ERROR: vocalis install failed. Check $ROOT/pip.log or run with --no-binary"
+    exit 1
+  }
+fi
+# Optional: piper voices (heavy, 34MB + build). Install only if requested or already present.
+for a in "$@"; do case "$a" in --with-piper) echo "Installing piper voices (--with-piper) ..."; "$PIP" install --no-cache-dir -e "$ROOT[piper]" --upgrade || echo "piper install failed — kokoro will still work"; break;; esac; done
+# If pip extra piper was already requested via existing venv, keep it; otherwise skip to save RAM
 
 # 6. standalone binary (preferred) — skip with --no-binary
-# Linux OOM guard: building the binary needs ~3 GB RAM (torch+scipy). On low-RAM machines it
-# can make the machine appear to crash/OOM-kill. Check first and offer venv-only fallback.
+# Linux OOM guard: PyInstaller Analysis with kokoro+whisper+piper can peak >8GB and OOM-kill even on 32GB.
+# Check RAM and be lean; always fall back to venv on failure (don't crash host).
 BINARY="$ROOT/dist/Vocalis/Vocalis"
 _should_build=1
 if [ "$NO_BINARY" -ne 0 ]; then
   _should_build=0
 else
-  # Check available RAM (Linux); if <3.5 GB, warn and skip unless --with-binary forced
   _force=0
   for a in "$@"; do case "$a" in --with-binary) _force=1;; esac; done
   if [ "$_force" -eq 0 ] && [ -f /proc/meminfo ]; then
     _avail_kb=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
     _avail_mb=$((_avail_kb / 1024))
-    if [ "$_avail_mb" -gt 0 ] && [ "$_avail_mb" -lt 3500 ]; then
+    # Even 32GB can OOM with full hiddenimports (kokoro+piper+whisper). Warn if <8GB available, and skip piper in binary.
+    if [ "$_avail_mb" -gt 0 ] && [ "$_avail_mb" -lt 8000 ]; then
       echo ""
-      echo "Low RAM detected (${_avail_mb} MB available) — PyInstaller binary needs ~3 GB and will"
-      echo "likely OOM/crash. Skipping binary build and using venv mode (faster, same features)."
-      echo "To force the build anyway: bash scripts/install.sh --with-binary"
+      echo "Low RAM detected (${_avail_mb} MB available) — PyInstaller binary is RAM-heavy (kokoro+piper+whisper)"
+      echo "and can OOM even on 32GB if hiddenimports are too broad. Skipping binary build; venv mode is leaner."
+      echo "To force: bash scripts/install.sh --with-binary  or use --no-binary then build manually"
       _should_build=0
+    fi
+    # Also check swap
+    _swap_kb=$(awk '/SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    if [ "$_swap_kb" -eq 0 ] && [ "$_avail_mb" -lt 16000 ]; then
+      echo "No swap and ${_avail_mb}MB RAM — binary build may still OOM-kill. Will try but fallback to venv on failure."
     fi
   fi
 fi
 if [ "$_should_build" -eq 1 ]; then
   echo ""
-  echo "Building standalone binary (PyInstaller, ~1.5 GB, a few minutes) ..."
-  echo "If this crashes/hangs, re-run with --no-binary to use venv mode (recommended on <4 GB RAM)."
-  # Limit parallelism to reduce RAM spike
+  echo "Building standalone binary (PyInstaller, ~1.5 GB binary, a few minutes) ..."
+  echo "If this crashes/hangs/OOMs, re-run with --no-binary (venv mode is same features, no build needed)."
+  echo "Lean spec: piper excluded from binary by default (use venv for Piper voices: .venv/bin/pip install -e .[piper])"
   export PYINSTALLER_COMPILE_BOOTLOADER=0
-  "$PIP" install --upgrade pyinstaller >/dev/null 2>&1 || true
-  # Single-threaded, low-memory build: strip + no UPX on Linux (see spec)
-  if "$VENV/bin/pyinstaller" packaging/vocalis.spec --noconfirm --clean --log-level=WARN; then
+  # Keep pip/pyinstaller low-memory
+  export PYTHONHASHSEED=0
+  "$PIP" install --no-cache-dir --upgrade pyinstaller >/dev/null 2>&1 || true
+  # Limit Python GC and use single process; timeout after 15 min to avoid hanging host
+  if timeout 900 "$VENV/bin/pyinstaller" packaging/vocalis.spec --noconfirm --clean --log-level=WARN; then
     echo "Binary built: $BINARY"
   else
-    echo "Binary build failed — falling back to venv script"
+    rc=$?
+    echo "Binary build failed (exit $rc) — falling back to venv script (this is expected on low-RAM or OOM)."
     echo "Tip: use --no-binary for venv-only install: bash scripts/install.sh --no-binary"
+    echo "For Piper voices in venv: .venv/bin/pip install -e .[piper]"
     BINARY=""
   fi
 else

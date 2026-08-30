@@ -22,13 +22,32 @@ icon = ICON_ICO if Path(ICON_ICO).exists() else (ICON_PNG if Path(ICON_PNG).exis
 block_cipher = None
 
 hidden = []
-# Keep hiddenimports lean — collecting all of scipy/tensorflow OOMs Linux (was crashing).
-# Only pull what we actually need; PyInstaller will discover transitive deps.
-hidden += collect_submodules("faster_whisper")
-hidden += collect_submodules("openwakeword")
-hidden += collect_submodules("kokoro")
-hidden += collect_submodules("piper")
-hidden += collect_submodules("sounddevice")
+# Keep hiddenimports lean — collecting all of scipy/torch/tensorflow OOMs Linux (32GB still crashed).
+# Let PyInstaller discover via entry.py; only add what it misses.
+# Heavy packages (kokoro/piper) are explicit, not full collect_submodules.
+try:
+    hidden += collect_submodules("faster_whisper", filter=lambda name: "test" not in name and "model" not in name)
+except Exception:
+    hidden += ["faster_whisper"]
+try:
+    hidden += collect_submodules("openwakeword", filter=lambda name: "test" not in name)
+except Exception:
+    hidden += ["openwakeword"]
+# kokoro/piper/sounddevice: explicit, not full tree (kokoro pulls torch; piper pulls espeak)
+hidden += ["kokoro", "kokoro.pipeline", "kokoro.model"]
+hidden += ["sounddevice"]
+# piper is optional (pip install -e .[piper]); include only if installed to keep base binary lean
+try:
+    import importlib.util
+    if importlib.util.find_spec("piper") is not None:
+        hidden += ["piper", "piper.voice", "piper.config", "piper.phonemize_espeak"]
+        # don't collect all piper submodules on low-RAM; just the core
+        try:
+            hidden += collect_submodules("piper", filter=lambda n: n in ("piper.voice", "piper.config"))
+        except Exception:
+            pass
+except Exception:
+    pass
 # scipy: only the bits openwakeword actually uses (signal/special), not the whole 200-module tree
 for _m in ("scipy.signal", "scipy.special", "scipy.linalg", "scipy.spatial"):
     try:
@@ -36,11 +55,9 @@ for _m in ("scipy.signal", "scipy.special", "scipy.linalg", "scipy.spatial"):
     except Exception:
         pass
 # onnxruntime for wake word — onnx only, no tflite required
-hidden += collect_submodules("onnxruntime")
-# Do NOT collect tensorflow/tflite_runtime — onnx-only build per user request
-# (previously collected tflite_runtime if present, now explicitly excluded)
-# openai + platformdirs are lightweight but ensure hooks
-hidden += collect_submodules("openai")
+hidden += collect_submodules("onnxruntime", filter=lambda n: "test" not in n and "tools" not in n)
+# openai is lightweight
+hidden += ["openai", "openai.resources", "openai.types"]
 
 datas = []
 datas += collect_data_files("faster_whisper", include_py_files=False)
@@ -77,21 +94,24 @@ try:
     datas += collect_data_files("soundfile", include_py_files=False)
 except Exception:
     pass
-# piper espeak-ng data and voices (needed for Piper TTS)
+# piper espeak-ng data and voices (needed for Piper TTS) — only if piper installed
 try:
-    datas += collect_data_files("piper", include_py_files=False)
+    import importlib.util
+    if importlib.util.find_spec("piper") is not None:
+        datas += collect_data_files("piper", include_py_files=False)
 except Exception:
     pass
 
 # Linux OOM guard: on low-RAM machines PyInstaller can get killed. Keep excludes aggressive.
 _excludes = [
     "torch.cuda", "torch.backends.cuda", "torch.backends.cudnn",
-    "torch.distributed", "triton",
+    "torch.distributed", "triton", "triton.language",
     "matplotlib", "matplotlib.tests", "mpl_toolkits",
     "numpy.tests", "numpy.distutils", "scipy.tests",
-    "PIL", "cv2", "tkinter", "IPython", "jupyter",
+    "PIL", "cv2", "tkinter", "IPython", "jupyter", "pytest",
     "tensorflow", "tensorflow.python",  # not needed — we use onnx
     "tflite_runtime", "tflite",  # onnx-only: explicitly exclude tflite
+    "xformers", "transformers.tests", "ctranslate2.tests",
     # DO NOT exclude scipy.signal/special — openwakeword/custom_verifier_model.py requires it
 ]
 

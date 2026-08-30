@@ -103,7 +103,23 @@ def config_path() -> Path:
 
 
 def _norm_model_id(s: str) -> str:
-    return (s or "").strip().lstrip("/\\").strip()
+    # Normalize model ids: trim, strip leading slashes (from old bug where provider returned /model),
+    # but keep namespace like unsloth/Llama or openai/gpt-oss. Also handle Windows/Unix file paths.
+    raw = (s or "").strip()
+    if not raw:
+        return ""
+    # Remove leading slashes/backslashes (old provider bug: "/ling-3.0-tiny-apex")
+    norm = raw.lstrip("/\\").strip()
+    # If it looks like a file path (C:\models\foo.gguf or /models/foo.gguf), keep basename only
+    # if it's a gguf/bin/onnx. Don't strip for normal model ids like ling-3.0-tiny-apex or openai/gpt-oss-20b
+    low = norm.lower()
+    if low.endswith((".gguf", ".bin", ".onnx")):
+        if "\\" in norm:
+            norm = norm.replace("\\", "/").split("/")[-1]
+        elif "/" in norm and ":" not in norm:
+            # Unix file path without drive letter
+            norm = norm.split("/")[-1]
+    return norm.strip()
 
 
 def load_config() -> Config:
@@ -141,6 +157,15 @@ def load_config() -> Config:
             raw["system_prompt"] = DEFAULT_SYSTEM_PROMPT
     cfg = Config(**{k: v for k, v in raw.items() if k in known})
     cfg.llm_model = _norm_model_id(cfg.llm_model)
+    # Ensure llm_model is never empty — fallback to default for the base_url
+    if not cfg.llm_model:
+        # Guess default based on base_url (Ollama vs LM Studio)
+        if "1234" in cfg.llm_base_url or "lm-studio" in cfg.llm_base_url.lower():
+            cfg.llm_model = "openai/gpt-oss-20b"  # generic LM Studio default, will be validated via list_models
+        elif "8080" in cfg.llm_base_url:
+            cfg.llm_model = "unsloth/Llama-3.2-1B-Instruct"
+        else:
+            cfg.llm_model = "llama3.2"
     if cfg.llm_api_key.strip() in ("vocalis-local", "ollama", "lm-studio", "unsloth", "none"):
         cfg.llm_api_key = ""
     if cfg.system_prompt.strip() == _old_prompt.strip() or _old_with_lithium in cfg.system_prompt:

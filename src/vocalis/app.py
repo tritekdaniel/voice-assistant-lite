@@ -464,10 +464,17 @@ class SettingsDialog(QDialog):
         self._model.setInsertPolicy(QComboBox.NoInsert)
         self._model.setMinimumWidth(260)
         cur_model = (cfg.llm_model or "").strip().lstrip("/\\").strip()
-        # No default hints — dropdown only shows current + fetched provider models
+        # Store last fetched ids to validate selection on save
+        self._last_fetched_ids: list[str] = []
+        # Show current model + hints for current preset if no fetch yet
         self._model.addItems([cur_model] if cur_model else [])
+        # Also add hints for current preset as selectable fallback (so combo not empty)
+        _preset_for_hints = guess
+        for h in LLM_SMALL_HINTS.get(_preset_for_hints, []):
+            if h != cur_model and h not in [self._model.itemText(i) for i in range(self._model.count())]:
+                self._model.addItem(h, h)
         self._model.setCurrentText(cur_model)
-        self._model.setToolTip("Click Refresh to load models from the provider via /v1/models")
+        self._model.setToolTip("Click Refresh to load models from the provider via /v1/models — selected model will be auto-loaded on prompt (LM Studio TTL)")
         self._model.lineEdit().setPlaceholderText("select or type model id — click Refresh to fetch from provider")
         model_row = QHBoxLayout()
         model_row.addWidget(self._model, 1)
@@ -957,7 +964,9 @@ class SettingsDialog(QDialog):
         if not ids:
             self._lbl_models.setText("No models returned — check Base URL / API key, or type a model id manually.")
             self._lbl_models.setStyleSheet("color:#f59e0b; font-size:11px;")
+            self._last_fetched_ids = []
             return
+        self._last_fetched_ids = list(ids)
         # normalize current (strip leading slash from old saves like "\Ling...")
         _cur_raw = self._model.currentData() if isinstance(self._model.currentData(), str) and self._model.currentData() else self._model.currentText()
         cur = _cur_raw.strip().lstrip("/\\").strip()
@@ -966,7 +975,7 @@ class SettingsDialog(QDialog):
         # preserve current typed value
         self._model.blockSignals(True)
         self._model.clear()
-        # add current first if not in list (normalized)
+        # add current first if not in list (normalized) — keep it so custom file paths like C:\models\foo.gguf aren't lost
         if cur and cur not in ids:
             self._model.addItem(cur, cur)
         for mid in ids:
@@ -974,18 +983,39 @@ class SettingsDialog(QDialog):
             if cur and mid == cur:
                 continue
             self._model.addItem(mid, mid)
+        # Validate selection: if cur is known and in list, keep it; otherwise keep typed but warn
+        if cur and cur not in ids:
+            self._lbl_models.setText(f"Loaded {len(ids)} models — current '{cur}' not in provider list, but will be auto-loaded on prompt (LM Studio) if valid.")
+            self._lbl_models.setStyleSheet("color:#f59e0b; font-size:11px;")
+        else:
+            self._lbl_models.setText(f"Loaded {len(ids)} models — smaller (1B–3B) are fastest. Select one.")
+            self._lbl_models.setStyleSheet("color:#22c55e; font-size:11px;")
         self._model.setCurrentText(cur)
         self._model.blockSignals(False)
-        self._lbl_models.setText(f"Loaded {len(ids)} models — smaller (1B–3B) are fastest. Select one.")
-        self._lbl_models.setStyleSheet("color:#22c55e; font-size:11px;")
-        log.info("Fetched %d LLM models from %s", len(ids), self._base_url.text().strip())
+        log.info("Fetched %d LLM models from %s (current %r)", len(ids), self._base_url.text().strip(), cur)
 
     def _on_models_err(self, err: str) -> None:
         self._btn_refresh_models.setEnabled(True)
         self._btn_refresh_models.setText("Refresh")
-        self._lbl_models.setText(f"Could not fetch models: {err[:120]} — you can still type a model id manually.")
+        # Show hints for current preset when fetch fails (so user can still pick a known model)
+        preset = self._preset.currentText()
+        hints = LLM_SMALL_HINTS.get(preset, LLM_SMALL_HINTS.get("Custom", []))
+        hint_txt = f" — try: {', '.join(hints[:3])}" if hints else ""
+        self._lbl_models.setText(f"Could not fetch models: {err[:120]} — you can still type a model id manually{hint_txt}.")
         self._lbl_models.setStyleSheet("color:#f87171; font-size:11px;")
         log.warning("Fetch models failed: %s", err)
+        # Also populate hints as selectable items so the combo is not empty
+        if hints and self._model.count() <= 1:
+            cur = self._model.currentText().strip()
+            self._model.blockSignals(True)
+            # Keep current, add hints that are not already there
+            existing = {self._model.itemText(i).split(" —")[0].strip() for i in range(self._model.count())}
+            for h in hints:
+                if h not in existing:
+                    self._model.addItem(h, h)
+            if cur:
+                self._model.setCurrentText(cur)
+            self._model.blockSignals(False)
 
     def _on_voice_changed(self, _idx: int) -> None:
         # data holds pure voice id, display may be "af_heart — warm..."
@@ -1154,7 +1184,12 @@ class SettingsDialog(QDialog):
     def _save(self) -> None:
         c = self.cfg
         c.llm_base_url = self._base_url.text().strip() or c.llm_base_url
-        c.llm_model = self._model_id() or c.llm_model
+        mid = self._model_id()
+        if not mid:
+            QMessageBox.warning(self, "Model", "Model id is empty — please select or type a model (e.g. ling-3.0-tiny-apex).")
+            return
+        # Normalize and keep the typed id even if not in fetched list (LM Studio may have it but not yet listed)
+        c.llm_model = mid
         # Allow clearing API key (empty is valid for local providers)
         c.llm_api_key = self._api_key.text().strip()
         c.temperature = float(self._temp.value())

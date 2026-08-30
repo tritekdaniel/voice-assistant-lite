@@ -32,23 +32,36 @@ def _apply_flags(args, cfg) -> None:
     from dataclasses import fields
 
     names = {f.name for f in fields(type(cfg))}
+    # Normalize model ids like config does (strip leading /\, handle Windows paths)
+    def _norm(v: str | None) -> str | None:
+        if v is None:
+            return None
+        s = v.strip().lstrip("/\\").strip()
+        # keep namespace like unsloth/ but basename gguf
+        if "\\" in s or ("/" in s and s.count("/") > 1 and ":" not in s):
+            if s.lower().endswith((".gguf", ".bin", ".onnx")):
+                s = s.replace("\\", "/").split("/")[-1]
+        return s
     mapping = {
         "llm_base_url": args.base_url,
-        "llm_model": args.model,
+        "llm_model": _norm(args.model) if args.model else None,
         "llm_api_key": args.api_key,
         "system_prompt": args.system_prompt,
         "temperature": args.temperature,
-        "whisper_model": args.whisper_model,
-        "tts_voice": args.voice,
+        "whisper_model": args.whisper_model.strip() if args.whisper_model else None,
+        "tts_voice": args.voice.strip().lstrip("/\\") if args.voice else None,
         "tts_speed": args.speed,
-        "tts_engine": args.tts_engine,
-        "piper_model": args.piper_model,
-        "wake_word": args.wake_word,
+        "tts_engine": args.tts_engine.strip().lower() if args.tts_engine else None,
+        "piper_model": args.piper_model.strip() if args.piper_model else None,
+        "wake_word": args.wake_word.strip().lstrip("/\\") if args.wake_word else None,
         "wakeword_threshold": args.wakeword_threshold,
     }
     changed = False
     for name, value in mapping.items():
         if value is not None and name in names:
+            # Don't overwrite with empty string
+            if isinstance(value, str) and not value.strip():
+                continue
             setattr(cfg, name, value)
             changed = True
     return changed

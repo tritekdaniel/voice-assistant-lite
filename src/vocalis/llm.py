@@ -92,10 +92,13 @@ class LLMClient:
         self._is_placeholder = _is_placeholder_key(raw_key)
         wire_key = raw_key if raw_key and not self._is_placeholder else "not-needed"
         self._client = OpenAI(base_url=base_url, api_key=wire_key)
-        self.model = model
+        # Normalize model id like config does (handles leading slash, Windows paths)
+        self.model = self._norm_id(model)
+        if not self.model and model:
+            self.model = (model or "").strip()
         self.temperature = temperature
         self._base_url_raw = base_url
-        log.debug("LLMClient base_url=%s model=%s temp=%.2f api_key=%s", base_url, model, temperature, "set" if raw_key else "none")
+        log.debug("LLMClient base_url=%s model=%s temp=%.2f api_key=%s", base_url, self.model, temperature, "set" if raw_key else "none")
 
     def _ensure_lmstudio_model_loaded(self, timeout: float = 60.0) -> bool:
         """If base_url looks like LM Studio, ensure the selected model is loaded.
@@ -296,16 +299,17 @@ class LLMClient:
 
     @staticmethod
     def _norm_id(raw: str) -> str:
-        """Normalize provider model ids: strip leading slashes, handle Windows paths, keep map like 'unsloth/...'."""
+        """Normalize provider model ids: strip leading slashes, handle file paths, keep namespace like 'unsloth/...'."""
         s = (raw or "").strip()
-        # Remove leading slashes/backslashes that some providers return for file paths
-        s = s.lstrip("/\\")
-        # If it's a Windows path like C:\models\foo.gguf or /models/foo, take basename
-        # but keep namespace like 'unsloth/foo' or 'llama3.2:1b' intact.
-        if "\\" in s or ("/" in s and s.count("/") > 1 and ":" not in s):
-            # Heuristic: if it looks like a file path with .gguf/.bin, take basename
-            if s.lower().endswith((".gguf", ".bin", ".onnx")):
+        if not s:
+            return ""
+        s = s.lstrip("/\\").strip()
+        low = s.lower()
+        if low.endswith((".gguf", ".bin", ".onnx")):
+            if "\\" in s:
                 s = s.replace("\\", "/").split("/")[-1]
+            elif "/" in s and ":" not in s:
+                s = s.split("/")[-1]
         return s.strip()
 
     def list_models(self) -> list[str]:

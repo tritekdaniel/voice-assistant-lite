@@ -106,39 +106,94 @@ class LLMClient:
             self.model = (model or "").strip()
         self.temperature = temperature
         self._base_url_raw = base_url
+        # LM Studio: remember last successful ensure to avoid re-loading every turn
+        self._lmstudio_last_ok: float = 0.0
+        self._lmstudio_last_model: str | None = None
         log.debug("LLMClient base_url=%s model=%s temp=%.2f api_key=%s", base_url, self.model, temperature, "set" if raw_key else "none")
 
-    def _ensure_lmstudio_model_loaded(self, timeout: float = 60.0) -> bool:
+    def _is_lmstudio_model_already_loaded(self, origin: str, headers: dict[str, str]) -> bool:
+        """Check via LM Studio REST whether model is already loaded — avoids redundant POST."""
+        import httpx
+        # LM Studio exposes several endpoints depending on version; try in order
+        candidates = [
+            f"{origin}/api/v0/models",          # LM Studio 0.x
+            f"{origin}/api/v1/models",          # LM Studio 1.x
+            f"{origin}/v1/models",              # OpenAI-compatible (also works)
+        ]
+        for url in candidates:
+            try:
+                with httpx.Client(timeout=5.0) as c:
+                    r = c.get(url, headers=headers)
+                    if r.status_code != 200:
+                        continue
+                    data = r.json()
+                    ids: set[str] = set()
+                    if isinstance(data, dict):
+                        if "data" in data and isinstance(data["data"], list):
+                            for m in data["data"]:
+                                mid = m.get("id") or m.get("name") or ""
+                                if mid:
+                                    ids.add(self._norm_id(str(mid)).lower())
+                                    ids.add(str(mid).lower())
+                        if "models" in data and isinstance(data["models"], list):
+                            for m in data["models"]:
+                                mid = m.get("name") or m.get("id") or ""
+                                if mid:
+                                    ids.add(self._norm_id(str(mid)).lower())
+                                    ids.add(str(mid).lower())
+                    # also handle bare list
+                    if isinstance(data, list):
+                        for m in data:
+                            if isinstance(m, dict):
+                                mid = m.get("id") or m.get("name") or ""
+                                if mid:
+                                    ids.add(self._norm_id(str(mid)).lower())
+                    want = self._norm_id(self.model).lower()
+                    if want and (want in ids or self.model.lower() in ids):
+                        log.debug("LM Studio model %r already loaded (via %s)", self.model, url)
+                        return True
+            except Exception:
+                continue
+        return False
+
+    def _ensure_lmstudio_model_loaded(self, timeout: float = 60.0, force: bool = False) -> bool:
         """If base_url looks like LM Studio, ensure the selected model is loaded.
 
         LM Studio exposes POST {origin}/api/v1/models/load (REST API) which is separate
         from the OpenAI-compatible /v1/chat/completions. The OpenAI endpoint does not
-        auto-load evicted models (TTL/auto-evict). We proactively load here so the
-        prompt request doesn't fail with 'model not loaded' / 404.
+        auto-load evicted models (TTL/auto-evict). We load on error (404/model_not_loaded)
+        so the prompt request doesn't fail. Proactive calls are throttled + skip if already loaded.
 
         Returns True if we attempted and succeeded (or already loaded), False if we
         skipped (not LM Studio) or failed — caller should still try the chat request.
         """
-        # Heuristic: LM Studio default is 1234, but user may use any port. Try the REST load
-        # endpoint only if the origin responds to it; otherwise no-op.
         try:
+            import time as _time
             from urllib.parse import urlparse
             import httpx
 
             raw = str(self._base_url_raw).rstrip("/")
             parsed = urlparse(raw if "://" in raw else f"http://{raw}")
             origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else raw
-            # LM Studio REST load is at /api/v1/models/load (not /v1/models)
-            # Derive origin from base_url: e.g. http://localhost:1234/v1 -> http://localhost:1234
             load_url = f"{origin}/api/v1/models/load"
-            # Don't spam if model is empty
             if not self.model or self.model.strip().lower() in ("", "none"):
                 return False
             headers: dict[str, str] = {"Content-Type": "application/json"}
             if not self._is_placeholder and self._api_key_raw:
                 headers["Authorization"] = f"Bearer {self._api_key_raw}"
-            # Quick check: if origin is clearly Ollama (11434) we still try, but it will 404 and we ignore.
-            # Use short connect timeout to avoid hanging headless.
+
+            # Throttle: don't POST again if we succeeded recently for same model
+            if not force:
+                age = _time.monotonic() - self._lmstudio_last_ok
+                if self._lmstudio_last_model == self.model and age < 120:
+                    log.debug("LM Studio ensure-loaded throttled (%.0fs ago) for %r — skipping", age, self.model)
+                    return True
+                # Check if already loaded via GET before POST — avoids reload every turn
+                if self._is_lmstudio_model_already_loaded(origin, headers):
+                    self._lmstudio_last_ok = _time.monotonic()
+                    self._lmstudio_last_model = self.model
+                    return True
+
             payload = {"model": self.model}
             log.info("LM Studio ensure-loaded: POST %s model=%r", load_url, self.model)
             with httpx.Client(timeout=timeout) as c:
@@ -149,16 +204,20 @@ class LLMClient:
                         log.info("LM Studio model loaded: %s (%.1fs)", data.get("instance_id") or self.model, data.get("load_time_seconds", 0))
                     except Exception:
                         log.info("LM Studio model loaded: %s", self.model)
+                    self._lmstudio_last_ok = _time.monotonic()
+                    self._lmstudio_last_model = self.model
                     return True
                 elif r.status_code == 404:
-                    # Not LM Studio (Ollama/Unsloth) — silently skip
                     log.debug("LM Studio load endpoint not found (404) — not LM Studio, skipping")
                     return False
                 else:
-                    # 400 may mean already loaded, downloading, or unknown model — log and still try chat
                     txt = r.text[:400] if hasattr(r, "text") else ""
                     log.warning("LM Studio load returned %s: %s — will still try chat", r.status_code, txt[:200])
-                    return r.status_code in (200, 400)  # 400 sometimes means already loaded with different config
+                    ok = r.status_code in (200, 400)
+                    if ok:
+                        self._lmstudio_last_ok = _time.monotonic()
+                        self._lmstudio_last_model = self.model
+                    return ok
         except Exception as e:
             log.debug("LM Studio ensure-loaded skipped/failed: %s", e)
         return False
@@ -227,10 +286,8 @@ class LLMClient:
                         continue
 
     def stream_reply(self, messages: list[dict], tools: list[dict] | None = None) -> Iterator[str]:
-        try:
-            self._ensure_lmstudio_model_loaded()
-        except Exception:
-            pass
+        # No proactive POST — only load on demand if chat returns 404/model_not_loaded.
+        # This avoids reloading every turn when LM Studio already has the model warm.
         self._pending_tool_calls: list[dict] = []
         log.info("LLM stream start model=%s msgs=%d tools=%s", self.model, len(messages), bool(tools))
         tool_calls: dict[int, dict] = {}
@@ -244,6 +301,13 @@ class LLMClient:
                 else:
                     self._pending_tool_calls = []
                 log.info("LLM stream done")
+                # Mark LM Studio model as warm — avoids redundant GET/POST next turn
+                try:
+                    import time as _t
+                    self._lmstudio_last_ok = _t.monotonic()
+                    self._lmstudio_last_model = self.model
+                except Exception:
+                    pass
                 return
             except BaseException as e:
                 msg = str(e).lower()
@@ -255,7 +319,7 @@ class LLMClient:
                 if is_model_err and attempt == 0:
                     log.warning("LLM stream model-not-loaded, trying ensure-loaded + retry: %s", e)
                     try:
-                        if self._ensure_lmstudio_model_loaded(timeout=90.0):
+                        if self._ensure_lmstudio_model_loaded(timeout=90.0, force=True):
                             continue
                     except Exception as re:
                         log.debug("Retry after load also failed: %s", re)
@@ -288,11 +352,6 @@ class LLMClient:
 
     def check(self) -> str:
         log.info("LLM check base_url=%s model=%s", self._client.base_url, self.model)
-        # Proactive load for LM Studio so Test LLM doesn't fail when model is cold
-        try:
-            self._ensure_lmstudio_model_loaded()
-        except Exception:
-            pass
         try:
             r = self._client.chat.completions.create(
                 model=self.model,
@@ -302,6 +361,12 @@ class LLMClient:
             )
             out = (r.choices[0].message.content or "").strip()
             log.info("LLM check ok: %r", out)
+            try:
+                import time as _t2
+                self._lmstudio_last_ok = _t2.monotonic()
+                self._lmstudio_last_model = self.model
+            except Exception:
+                pass
             return out
         except BaseException as e:
             msg = str(e).lower()
@@ -309,7 +374,7 @@ class LLMClient:
             if any(s in msg for s in ("model not found", "model not loaded", "no model loaded", "failed to load model", "404")):
                 log.warning("LLM check failed with model-not-loaded, trying ensure-loaded + retry: %s", e)
                 try:
-                    if self._ensure_lmstudio_model_loaded(timeout=90.0):
+                    if self._ensure_lmstudio_model_loaded(timeout=90.0, force=True):
                         # retry once
                         r = self._client.chat.completions.create(
                             model=self.model,

@@ -246,7 +246,7 @@ class Session:
     # -- wake word thread ---------------------------------------------------
 
     def _wake_loop(self) -> None:
-        log.debug("Wake loop started")
+        log.debug("Wake loop started (onnx-only)")
         warned = False
         consecutive = 0
         while not self._stop.is_set():
@@ -254,19 +254,35 @@ class Session:
                 frame = self._wake_frames.get(timeout=0.25)
             except queue.Empty:
                 continue
+            # Defensive: ensure 1280 samples (audio_io already pads, but be safe)
+            try:
+                if frame.shape[0] != FRAME_SAMPLES:
+                    log.warning("Wake frame size %s != %s, normalizing", frame.shape[0], FRAME_SAMPLES)
+                    if frame.shape[0] > FRAME_SAMPLES:
+                        frame = frame[:FRAME_SAMPLES].copy()
+                    else:
+                        import numpy as np
+                        frame = np.pad(frame, (0, FRAME_SAMPLES - frame.shape[0])).astype(np.int16, copy=False)
+            except Exception:
+                pass
             try:
                 fired = self._wakeword.trigger(frame)
                 consecutive = 0  # reset on success
             except BaseException as e:  # noqa: BLE001
                 consecutive += 1
-                # Log first error at exception, then every 50th to avoid spam (was every 80ms)
+                # Log first error at exception, then every 50th to avoid spam
                 if consecutive == 1:
-                    log.exception("Wake word trigger failed: %s", e)
+                    # Include shape/threshold for diagnostics, don't leak huge traceback every frame
+                    try:
+                        shape = getattr(frame, "shape", "?")
+                    except Exception:
+                        shape = "?"
+                    log.exception("Wake word trigger failed (shape=%s thr=%.2f): %s", shape, getattr(self._wakeword, "threshold", 0), e)
                     self.listener.error(f"Wake word error: {e} — check Settings -> Wake word (log: {__import__('pathlib').Path(__import__('vocalis.config', fromlist=['data_dir']).data_dir()) / 'logs' / 'vocalis.log'})")
                 elif consecutive % 50 == 0:
                     log.warning("Wake word still failing (%d times): %s", consecutive, e)
-                # Back off a bit to avoid hot loop when model is broken
-                time.sleep(0.5 if consecutive < 10 else 1.0)
+                # Shorter backoff now that onnx is stable; old 0.5-1s made wake appear dead
+                time.sleep(0.05 if consecutive < 10 else 0.2)
                 continue
             if fired:
                 log.info("Wake word detected (state=%s)", self.state.value)

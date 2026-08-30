@@ -61,17 +61,34 @@ def setup_logging(level: str = "INFO", also_console: bool = False) -> logging.Lo
     logging.captureWarnings(True)
 
     # Console handler — for headless or when explicitly requested
-    if also_console or _is_headless_env():
-        ch = logging.StreamHandler(sys.stdout)
-        ch.setLevel(lvl)
-        ch.setFormatter(fmt)
-        logger.addHandler(ch)
+    # In frozen windowed builds (PyInstaller console=False) sys.stdout/stderr are None — guard.
+    def _safe_stream(preferred):
+        if preferred is not None:
+            return preferred
+        # Fallback: if stdout is None try stderr, else no console handler
+        try:
+            if sys.stdout is not None:
+                return sys.stdout
+            if sys.stderr is not None:
+                return sys.stderr
+        except Exception:
+            pass
+        return None
+
+    console_stream = _safe_stream(sys.stdout if (also_console or _is_headless_env()) else sys.stderr)
+    if (also_console or _is_headless_env()):
+        if console_stream is not None:
+            ch = logging.StreamHandler(console_stream)
+            ch.setLevel(lvl)
+            ch.setFormatter(fmt)
+            logger.addHandler(ch)
+        # else: frozen windowed with no console — file handler only, no crash
     else:
-        # In GUI mode still log errors to stderr so `vocalis --check` sees them
-        ch = logging.StreamHandler(sys.stderr)
-        ch.setLevel(logging.WARNING)
-        ch.setFormatter(fmt)
-        logger.addHandler(ch)
+        if console_stream is not None:
+            ch = logging.StreamHandler(console_stream)
+            ch.setLevel(logging.WARNING)
+            ch.setFormatter(fmt)
+            logger.addHandler(ch)
 
     # Install global hooks so "closed before I could check" never happens again
     _install_hooks(logger)
@@ -137,7 +154,13 @@ def _version() -> str:
 
 
 def _is_headless_env() -> bool:
-    return any(a in sys.argv for a in ("--headless", "--check")) or not sys.stdout.isatty()
+    try:
+        stdout = getattr(sys, "stdout", None)
+        if stdout is None or not hasattr(stdout, "isatty"):
+            return any(a in sys.argv for a in ("--headless", "--check"))
+        return any(a in sys.argv for a in ("--headless", "--check")) or not stdout.isatty()
+    except Exception:
+        return any(a in sys.argv for a in ("--headless", "--check"))
 
 
 def _install_hooks(logger: logging.Logger) -> None:

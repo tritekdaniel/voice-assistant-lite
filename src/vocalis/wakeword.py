@@ -7,25 +7,25 @@ from pathlib import Path
 
 import numpy as np
 
-# --- SciPy 1.13+ workaround: stats import can hang on some systems ---
-# This must run BEFORE any import of openwakeword/sklearn/scipy
-try:
-    # Monkey-patch scipy.stats._distribution_infrastructure._generate_example
-    # to avoid the hang in entropy calculation at import time
-    import scipy.stats._distribution_infrastructure as _di
-    _orig_generate_example = _di._generate_example
-    def _safe_generate_example(self):
-        try:
-            return _orig_generate_example(self)
-        except Exception:
-            return "Example unavailable (scipy workaround)"
-    _di._generate_example = _safe_generate_example
-except Exception:
-    # If scipy not yet imported or patch fails, continue anyway
-    pass
+# --- SciPy 1.13+ workaround: applied lazily in ensure_loaded() ---
+# Do NOT import scipy at module load time — that import itself can hang on some
+# systems (entropy calc in _distribution_infrastructure). We patch on demand
+# just before importing openwakeword/sklearn. See _apply_scipy_workaround().
 
-# Also set env var to encourage scipy to use simpler code paths
-os.environ.setdefault("SCIPY_USE_PROPAGATE", "1")
+def _apply_scipy_workaround() -> None:
+    try:
+        import scipy.stats._distribution_infrastructure as _di  # type: ignore
+        orig = getattr(_di, "_generate_example", None)
+        if orig is not None and not getattr(orig, "_vocalis_patched", False):
+            def _safe_generate_example(self):  # type: ignore[no-untyped-def]
+                try:
+                    return orig(self)
+                except Exception:
+                    return "Example unavailable (scipy workaround)"
+            _safe_generate_example._vocalis_patched = True  # type: ignore[attr-defined]
+            _di._generate_example = _safe_generate_example  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
 from .logger import get_logger
 
@@ -49,31 +49,97 @@ def _writable_model_dir() -> Path:
         return Path(openwakeword.__file__).parent / "resources" / "models"
 
 
-def _resolve_pretrained_path(name: str, prefer_onnx: bool = True) -> Path | None:
-    """Resolve a pretrained name (e.g. hey_jarvis) to an explicit file in writable dir, downloading if needed."""
+def _download_onnx_file(url: str, target_dir: Path) -> None:
+    """Download a single .onnx URL to target_dir (no tflite)."""
+    try:
+        from openwakeword.utils import download_file
+        target_dir.mkdir(parents=True, exist_ok=True)
+        fname = url.split("/")[-1]
+        if fname.endswith(".tflite"):
+            url = url.replace(".tflite", ".onnx")
+            fname = fname.replace(".tflite", ".onnx")
+        dest = target_dir / fname
+        if dest.exists():
+            return
+        download_file(url, str(target_dir))
+    except Exception as e:
+        log.debug("onnx download failed %s -> %s: %s", url, target_dir, e)
+        raise
+
+
+def _download_onnx_for_spec(spec: str, target_dir: Path) -> None:
+    """Download onnx model for a spec name (hey_jarvis -> hey_jarvis_v0.1.onnx)."""
+    try:
+        import openwakeword
+        base = (spec or "").strip()
+        if not base or base == "custom":
+            return
+        # Normalize: strip path, take stem
+        key = base
+        if key not in openwakeword.MODELS:
+            # try without _v0.1 suffix or with path
+            stem = Path(base).stem
+            if stem in openwakeword.MODELS:
+                key = stem
+            elif stem.replace("_v0.1", "") in openwakeword.MODELS:
+                key = stem.replace("_v0.1", "")
+            else:
+                # substring match
+                for k in openwakeword.MODELS:
+                    if k in base:
+                        key = k
+                        break
+                else:
+                    return
+        url = openwakeword.MODELS[key]["download_url"]
+        _download_onnx_file(url, target_dir)
+        # Also ensure feature models (onnx only) are present
+        for fm in openwakeword.FEATURE_MODELS.values():
+            furl = fm["download_url"]
+            _download_onnx_file(furl, target_dir)
+        # silero vad is already onnx
+        for vm in openwakeword.VAD_MODELS.values():
+            vurl = vm["download_url"]
+            _download_onnx_file(vurl, target_dir)
+    except Exception as e:
+        log.debug("download for spec %r failed: %s", spec, e)
+        raise
+
+
+def _resolve_pretrained_path(name: str, prefer_onnx: bool = True) -> Path | None:  # noqa: ARG001
+    """Resolve a pretrained name (e.g. hey_jarvis) to an explicit .onnx file in writable dir, downloading if needed.
+
+    ONNX-only: we never require tflite. If a .tflite path is given we look for the .onnx sibling.
+    """
+    _ = prefer_onnx  # kept for compat, always onnx
     name = (name or "").strip()
     if not name:
         return None
-    # If it's already a file path that exists, return it
+    # If it's already a file path that exists, return it (prefer onnx sibling if tflite)
     p = Path(name).expanduser()
-    if p.exists() and p.suffix.lower() in (".onnx", ".tflite"):
-        return p
+    if p.exists():
+        if p.suffix.lower() == ".onnx":
+            return p
+        if p.suffix.lower() == ".tflite":
+            onnx_sibling = p.with_suffix(".onnx")
+            if onnx_sibling.exists():
+                log.info("Wake word %r is tflite, using onnx sibling %s", name, onnx_sibling)
+                return onnx_sibling
+            # keep tflite path but caller will handle conversion; return it so we can warn
+            return p
     # If name is "custom" without a path -> invalid
     if name == "custom":
-        raise ValueError("Wake word is 'custom' but no .onnx/.tflite file was selected — choose a file via Browse.")
-    # Map bare name to actual model file; openwakeword uses <name>_v0.1.*
-    # Known names have a suffix, unknown may already be the full stem
+        raise ValueError("Wake word is 'custom' but no .onnx file was selected — choose a file via Browse.")
     base = name
-    # If user passed hey_jarvis_v0.1, keep it; otherwise try bare name
+    # ONNX-only candidates
     candidates: list[str] = []
     if base in _KNOWN:
-        candidates = [f"{base}_v0.1.onnx", f"{base}_v0.1.tflite"] if prefer_onnx else [f"{base}_v0.1.tflite", f"{base}_v0.1.onnx"]
+        candidates = [f"{base}_v0.1.onnx"]
     else:
-        # Try as-is with both extensions
         stem = Path(base).stem
-        candidates = [f"{stem}.onnx", f"{stem}.tflite"] if prefer_onnx else [f"{stem}.tflite", f"{stem}.onnx"]
-        # Also try bare name as key substring
-        candidates.append(base)
+        # bare stem + versioned fallback
+        candidates = [f"{stem}.onnx", f"{stem}_v0.1.onnx"]
+        candidates.append(base if base.endswith(".onnx") else f"{base}.onnx")
     wdir = _writable_model_dir()
     # Check writable dir first
     for cand in candidates:
@@ -87,29 +153,34 @@ def _resolve_pretrained_path(name: str, prefer_onnx: bool = True) -> Path | None
         for cand in candidates:
             pp = pkg_dir / cand
             if pp.exists():
-                # Copy to writable for consistency? Just return it
                 return pp
     except Exception:
         pass
-    # Not found — try to download to writable dir
+    # Not found — try to download specific model (onnx only)
     try:
-        from openwakeword.utils import download_models
-        # Try specific name first, then all (also pulls melspectrogram/embedding)
-        tried_download = False
-        for dl_name in ([base] if base in _KNOWN else [base, ""]):
+        import openwakeword
+        wdir.mkdir(parents=True, exist_ok=True)
+        # Map base to download URL via openwakeword.MODELS
+        model_key = base if base in openwakeword.MODELS else None
+        if model_key is None:
+            # Try stem match (e.g. hey_jarvis_v0.1 -> hey_jarvis)
+            for k in openwakeword.MODELS:
+                if k in base:
+                    model_key = k
+                    break
+        if model_key and model_key in openwakeword.MODELS:
+            url = openwakeword.MODELS[model_key]["download_url"]
             try:
-                if dl_name:
-                    download_models(model_names=[dl_name], target_directory=str(wdir))
-                else:
-                    download_models(target_directory=str(wdir))
-                tried_download = True
-                break
+                _download_onnx_file(url, wdir)
             except Exception as e:
-                log.debug("download_models(%r) -> %s", dl_name, e)
-                continue
-        if not tried_download:
-            # Last resort: download all to default loc then copy? Just try default download
-            download_models(target_directory=str(wdir))
+                log.debug("download onnx for %r failed: %s", model_key, e)
+        else:
+            # Fallback: try generic download_models for this name (it will download tflite+onnx, we ignore tflite)
+            try:
+                from openwakeword.utils import download_models
+                download_models(model_names=[base] if base in _KNOWN else [], target_directory=str(wdir))
+            except Exception as e:
+                log.debug("download_models(%r) -> %s", base, e)
     except Exception as e:
         log.warning("Failed to download wake word model %r to %s: %s", name, wdir, e)
     # Re-check after download
@@ -117,50 +188,72 @@ def _resolve_pretrained_path(name: str, prefer_onnx: bool = True) -> Path | None
         pp = wdir / cand
         if pp.exists():
             return pp
-    # Fallback: let openwakeword try to resolve by name (may use tflite default)
+    # Also check if tflite was downloaded and onnx sibling now exists due to download_models' double-download
+    for cand in candidates:
+        tflite_cand = cand.replace(".onnx", ".tflite")
+        pp = wdir / tflite_cand
+        if pp.exists():
+            onnx_pp = pp.with_suffix(".onnx")
+            if onnx_pp.exists():
+                return onnx_pp
     return None
 
 
 def _patch_openwakeword_resources(writable_dir: Path) -> None:
-    """Monkey-patch openwakeword to use writable_dir for feature models in frozen builds."""
+    """Monkey-patch openwakeword to use writable_dir for feature models (onnx-only)."""
     try:
         import openwakeword
         import openwakeword.utils as ow_utils
-        # Patch get_pretrained_model_paths to prefer writable_dir for feature models
         orig_get_paths = openwakeword.get_pretrained_model_paths
 
-        def patched_get_paths(framework: str = "tflite"):
-            # Get original paths
-            paths = orig_get_paths(framework)
-            # For feature models (melspectrogram, embedding, VAD), prefer writable_dir
+        def patched_get_paths(framework: str = "onnx"):  # default onnx
+            # Force onnx — tflite is not required. Map any tflite request to onnx.
+            req_fw = "onnx" if framework not in ("onnx", "tflite") else framework
+            # Always fetch onnx paths for feature models, even if caller asked tflite
+            try:
+                paths = orig_get_paths("onnx")
+            except Exception:
+                paths = orig_get_paths(req_fw)
             feature_names = ["melspectrogram", "embedding_model", "silero_vad"]
             patched = []
             for path in paths:
                 name = Path(path).stem
                 if any(fn in name for fn in feature_names):
-                    # Check writable dir first
-                    for ext in (f".{framework}", ".onnx", ".tflite"):
-                        wp = writable_dir / f"{name}{ext}"
-                        if wp.exists():
-                            patched.append(str(wp))
+                    base_name = name.split("_v")[0] if "_v" in name else name
+                    found = False
+                    for check_name in (name, base_name):
+                        # onnx only
+                        for ext in (".onnx",):
+                            wp = writable_dir / f"{check_name}{ext}"
+                            if wp.exists():
+                                patched.append(str(wp))
+                                found = True
+                                break
+                        if found:
                             break
-                    else:
+                    if not found:
+                        # if writable doesn't have it, keep original onnx path (package resources)
                         patched.append(path)
                 else:
-                    patched.append(path)
+                    # For wake-word models, also prefer writable onnx if present
+                    stem = Path(path).stem
+                    wp_onnx = writable_dir / f"{stem}.onnx"
+                    if wp_onnx.exists():
+                        patched.append(str(wp_onnx))
+                    else:
+                        patched.append(path)
             return patched
 
         openwakeword.get_pretrained_model_paths = patched_get_paths
-        # Also patch the module where Model imports it
         if hasattr(ow_utils, "get_pretrained_model_paths"):
             ow_utils.get_pretrained_model_paths = patched_get_paths
-        log.debug("Patched openwakeword.get_pretrained_model_paths to use writable dir %s", writable_dir)
+        log.debug("Patched openwakeword.get_pretrained_model_paths to use writable dir %s (onnx-only)", writable_dir)
     except Exception as e:
         log.debug("Failed to patch openwakeword resources: %s", e)
 
 
 class WakeWord:
-    """openwakeword wrapper with trigger threshold + cooldown policy. Handles Linux frozen + onnx/tflite."""
+    """openwakeword wrapper with trigger threshold + cooldown policy. ONNX-only (no tflite required)."""
 
     def __init__(self, model_spec: str, threshold: float = 0.5, cooldown_ms: int = 800,
                  embeddings_path: str = ""):
@@ -176,58 +269,95 @@ class WakeWord:
         if self._model is not None:
             return
         log.info("Loading wake word model %r (threshold %.2f, cooldown %dms)", self._spec, self.threshold, int(self._cooldown_s*1000))
+        # Apply scipy workaround before importing anything that pulls in scipy/sklearn
+        _apply_scipy_workaround()
         # Ensure feature models are available BEFORE importing openwakeword.model
-        # because Model class may load them at import time
         wdir = _writable_model_dir()
         self._ensure_feature_models(wdir)
+
+        # Fail fast if onnxruntime not installed (we are onnx-only since user requested no tflite)
+        try:
+            import onnxruntime  # noqa: F401
+        except ImportError as e:
+            raise RuntimeError("onnxruntime is required for wake word (ONNX). Install with: pip install onnxruntime") from e
 
         import openwakeword.model as om
         import openwakeword
 
-        # Also patch resource paths for frozen builds BEFORE Model is used
-        if getattr(sys, "frozen", False):
-            _patch_openwakeword_resources(wdir)
+        # Patch resource paths for ALL builds (feature models must be in writable dir, onnx-only)
+        _patch_openwakeword_resources(wdir)
 
-        # Resolve to explicit file if possible (writable dir, handles frozen)
+        # Resolve to explicit .onnx file if possible (writable dir, handles frozen)
         p = Path(self._spec).expanduser()
-        is_file = p.exists() and p.suffix.lower() in (".onnx", ".tflite")
-        if is_file:
-            model_ref = str(p)
+        is_file = False
+        model_ref: str
+        if p.exists():
+            if p.suffix.lower() == ".onnx":
+                model_ref = str(p)
+                is_file = True
+            elif p.suffix.lower() == ".tflite":
+                # tflite given but we are onnx-only — look for onnx sibling
+                onnx_sibling = p.with_suffix(".onnx")
+                if onnx_sibling.exists():
+                    model_ref = str(onnx_sibling)
+                    is_file = True
+                    log.info("Wake word %r is tflite, using onnx sibling %s", self._spec, model_ref)
+                else:
+                    # Keep original but will fail with clear message — try to download onnx version
+                    model_ref = str(p)
+                    is_file = True
+                    log.warning("Wake word file %s is tflite but onnx is required — looking for onnx sibling %s", p, onnx_sibling)
+            else:
+                model_ref = str(p)
+                is_file = True
         else:
-            # Pretrained name — resolve to file in writable dir
             resolved = _resolve_pretrained_path(self._spec, prefer_onnx=True)
             if resolved is not None and resolved.exists():
                 model_ref = str(resolved)
                 is_file = True
                 log.info("Resolved wake word %r -> %s", self._spec, model_ref)
+                # If resolved is tflite (legacy cache), swap to onnx if exists
+                if model_ref.endswith(".tflite"):
+                    onnx_try = model_ref[:-7] + ".onnx"
+                    if Path(onnx_try).exists():
+                        model_ref = onnx_try
+                        log.info("Resolved tflite %r -> onnx %s", resolved, model_ref)
             else:
                 model_ref = self._spec
-                log.warning("Wake word %r not resolved to file, will let openwakeword search (tried %s)", self._spec, resolved)
+                log.warning("Wake word %r not resolved to file, will try name lookup (tried %s)", self._spec, resolved)
 
         ModelCls = getattr(om, "Model", None) or getattr(om, "WakewordModel", None)
         if ModelCls is None:
             raise ImportError("openwakeword.model has neither Model nor WakewordModel")
 
-        # Try onnx first, then tflite — Linux standalone often lacks tflite runtime issues and vice versa
         tried: list[str] = []
-        # Build kwargs variants: prefer explicit file paths + onnx, then tflite, then name-only
-        variants: list[dict] = []
-        for fw in ("onnx", "tflite"):
-            for key in ("wakeword_models", "models"):
-                variants.append({key: [model_ref], "inference_framework": fw})
-        # If we have a file, also try without explicit framework (let Model pick)
+        # ONNX-only variants. Try explicit onnx file with both kwarg names.
+        variants: list[dict] = [
+            {"wakeword_models": [model_ref], "inference_framework": "onnx"},
+            {"models": [model_ref], "inference_framework": "onnx"},
+        ]
+        # If we have a file, also try without explicit framework (Model defaults, but we force onnx via patch)
         if is_file:
             variants.append({"wakeword_models": [model_ref]})
             variants.append({"models": [model_ref]})
 
         for kwargs in variants:
+            # Force onnx if framework not set or is tflite
+            if kwargs.get("inference_framework") not in (None, "onnx"):
+                kwargs = dict(kwargs)
+                kwargs["inference_framework"] = "onnx"
+            # If model_ref is tflite, reject early with clear message (will be caught and retried)
+            if any(str(v).endswith(".tflite") for v in kwargs.get("wakeword_models", []) + kwargs.get("models", [])):
+                tried.append(f"{kwargs} -> tflite not supported (onnx-only build)")
+                continue
             try:
                 emb = Path(self._embeddings).expanduser() if self._embeddings else None
                 if emb is not None and emb.exists():
                     for ek in ("user_embeddings", "custom_verifier_models"):
                         try:
                             k2 = dict(kwargs)
-                            key = p.stem if is_file else model_ref
+                            key = p.stem if is_file else Path(model_ref).stem
+                            # key must match model's stem without version suffix? Use full stem.
                             k2[ek] = {key: str(emb)}
                             self._model = ModelCls(**k2)
                             log.info("Wake word loaded with %s (%s)", ek, kwargs)
@@ -235,32 +365,39 @@ class WakeWord:
                         except TypeError:
                             continue
                     self.error = f"could not load wake embeddings from {emb}; using model as-is"
+                # Ensure onnx file exists before calling Model (gives clearer error than Model's ValueError)
+                if is_file and not Path(model_ref).exists():
+                    raise FileNotFoundError(f"Wake word model file not found: {model_ref}")
+                # If not is_file, ensure resolved onnx exists; otherwise Model will try to find pretrained name
                 self._model = ModelCls(**kwargs)
-                log.info("Wake word loaded: %s framework=%s", model_ref, kwargs.get("inference_framework", "default"))
+                log.info("Wake word loaded: %s framework=%s", model_ref, kwargs.get("inference_framework", "onnx"))
                 return
             except Exception as e:
                 msg = str(e)
-                # If model file missing, ensure download to writable dir and retry once per variant
-                if any(s in msg for s in ("NoSuchFile", "Load model", "doesn't exist", "Failed", "Could not find pretrained")):
+                # If model file missing, try to download onnx version once and retry
+                if any(s in msg for s in ("NoSuchFile", "Load model", "doesn't exist", "Failed", "Could not find pretrained", "not found")):
                     try:
-                        wdir = _writable_model_dir()
-                        from openwakeword.utils import download_models
-                        if is_file:
-                            download_models(target_directory=str(wdir))
-                        else:
-                            try:
-                                download_models(model_names=[model_ref], target_directory=str(wdir))
-                            except Exception:
-                                download_models(target_directory=str(wdir))
-                        # Re-resolve after download
+                        # Try to download missing onnx
+                        try:
+                            _download_onnx_for_spec(self._spec, wdir)
+                        except Exception:
+                            pass
                         if not is_file:
-                            rr = _resolve_pretrained_path(self._spec, prefer_onnx=(kwargs.get("inference_framework") == "onnx"))
+                            rr = _resolve_pretrained_path(self._spec, prefer_onnx=True)
                             if rr is not None and rr.exists():
                                 kwargs = dict(kwargs)
-                                # patch the path in kwargs
                                 for k in ("wakeword_models", "models"):
                                     if k in kwargs:
                                         kwargs[k] = [str(rr)]
+                                model_ref = str(rr)
+                        # If is_file and tflite, check for onnx sibling after download
+                        if is_file and model_ref.endswith(".tflite"):
+                            onnx_try = model_ref[:-7] + ".onnx"
+                            if Path(onnx_try).exists():
+                                model_ref = onnx_try
+                                for k in ("wakeword_models", "models"):
+                                    if k in kwargs:
+                                        kwargs[k] = [model_ref]
                         self._model = ModelCls(**kwargs)
                         log.info("Wake word loaded after download: %s", kwargs)
                         return
@@ -269,32 +406,67 @@ class WakeWord:
                         continue
                 tried.append(f"{kwargs} -> {e}")
                 continue
-        raise RuntimeError(f"Could not init wake word model {self._spec!r} (resolved {model_ref!r}) with {tried}")
+        raise RuntimeError(f"Could not init wake word model {self._spec!r} (resolved {model_ref!r}) with {tried} — onnxruntime {__import__('onnxruntime').__version__ if 'onnxruntime' in __import__('sys').modules else '?'}; ensure .onnx model exists in {wdir}")
 
     def _ensure_feature_models(self, wdir: Path) -> None:
-        """Download/copy feature models (melspectrogram, embedding, VAD) to writable dir."""
+        """Ensure onnx feature models (melspectrogram, embedding, VAD) are in writable dir (no tflite)."""
+        feature_names = ["melspectrogram", "embedding_model", "silero_vad"]
+        # Try onnx-only download via helper (avoids downloading tflite bloat)
         try:
-            from openwakeword.utils import download_models
-            # This downloads all feature models + pretrained models to wdir
-            download_models(target_directory=str(wdir))
-            log.debug("Feature models ensured in %s", wdir)
+            import openwakeword
+            for key in ("melspectrogram", "embedding"):
+                if key in openwakeword.FEATURE_MODELS:
+                    url = openwakeword.FEATURE_MODELS[key]["download_url"]
+                    try:
+                        _download_onnx_file(url, wdir)
+                    except Exception as e:
+                        log.debug("Feature %s download failed: %s", key, e)
+            for key in openwakeword.VAD_MODELS:
+                url = openwakeword.VAD_MODELS[key]["download_url"]
+                try:
+                    _download_onnx_file(url, wdir)
+                except Exception as e:
+                    log.debug("VAD %s download failed: %s", key, e)
+            log.debug("Feature models (onnx) download attempted in %s", wdir)
         except Exception as e:
             log.warning("Could not download feature models to %s: %s", wdir, e)
-            # Try to copy from package resources as fallback
-            try:
-                import openwakeword
-                pkg_dir = Path(openwakeword.__file__).parent / "resources" / "models"
-                feature_names = ["melspectrogram", "embedding_model", "silero_vad"]
-                for name in feature_names:
-                    for ext in (".onnx", ".tflite"):
-                        src = pkg_dir / f"{name}{ext}"
-                        dst = wdir / f"{name}{ext}"
-                        if src.exists() and not dst.exists():
-                            import shutil
-                            shutil.copy2(src, dst)
-                            log.debug("Copied %s from package resources", src.name)
-            except Exception as e2:
-                log.debug("Fallback copy also failed: %s", e2)
+        # Fallback: copy missing .onnx from package resources
+        try:
+            import openwakeword
+            pkg_dir = Path(openwakeword.__file__).parent / "resources" / "models"
+            for name in feature_names:
+                dst = wdir / f"{name}.onnx"
+                if not dst.exists():
+                    src = pkg_dir / f"{name}.onnx"
+                    if src.exists():
+                        import shutil
+                        shutil.copy2(src, dst)
+                        log.debug("Copied %s from package resources to %s", src.name, dst)
+                    else:
+                        # Legacy tflite source? Try to copy then convert? Just warn
+                        src_tflite = pkg_dir / f"{name}.tflite"
+                        if src_tflite.exists():
+                            log.debug("Package has only %s.tflite, onnx missing — will download", name)
+        except Exception as e2:
+            log.debug("Fallback copy also failed: %s", e2)
+        missing = [f"{n}.onnx" for n in feature_names if not (wdir / f"{n}.onnx").exists()]
+        if missing:
+            log.warning("Feature models still missing in %s: %s (onxruntime will fail without them)", wdir, missing)
+        # Last resort: ensure package resources has onnx too (some code paths load from there directly)
+        try:
+            import openwakeword
+            pkg_dir = Path(openwakeword.__file__).parent / "resources" / "models"
+            pkg_dir.mkdir(parents=True, exist_ok=True)
+            for name in feature_names:
+                dst = pkg_dir / f"{name}.onnx"
+                if not dst.exists():
+                    src = wdir / f"{name}.onnx"
+                    if src.exists():
+                        import shutil
+                        shutil.copy2(src, dst)
+                        log.debug("Copied %s to package resources", dst.name)
+        except Exception as e3:
+            log.debug("Package resources copy failed: %s", e3)
 
     def score(self, chunk_int16: np.ndarray) -> float:
         self.ensure_loaded()

@@ -34,13 +34,10 @@ for _m in ("scipy.signal", "scipy.special", "scipy.linalg", "scipy.spatial"):
         hidden += collect_submodules(_m)
     except Exception:
         pass
-# onnxruntime for wake word (onnx preferred on Linux)
+# onnxruntime for wake word — onnx only, no tflite required
 hidden += collect_submodules("onnxruntime")
-# Do NOT collect tensorflow — huge (500 MB) and not needed; tflite_runtime is tiny if present
-try:
-    hidden += collect_submodules("tflite_runtime")
-except Exception:
-    pass
+# Do NOT collect tensorflow/tflite_runtime — onnx-only build per user request
+# (previously collected tflite_runtime if present, now explicitly excluded)
 # openai + platformdirs are lightweight but ensure hooks
 hidden += collect_submodules("openai")
 
@@ -88,6 +85,7 @@ _excludes = [
     "numpy.tests", "numpy.distutils", "scipy.tests",
     "PIL", "cv2", "tkinter", "IPython", "jupyter",
     "tensorflow", "tensorflow.python",  # not needed — we use onnx
+    "tflite_runtime", "tflite",  # onnx-only: explicitly exclude tflite
     # DO NOT exclude scipy.signal/special — openwakeword/custom_verifier_model.py requires it
 ]
 

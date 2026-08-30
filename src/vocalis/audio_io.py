@@ -58,7 +58,12 @@ class AudioIn:
                     data = np.frombuffer(bytes(indata), dtype=np.int16).copy()
                 # ensure expected size (pad/truncate if driver gave different block)
                 if data.shape[0] != FRAME_SAMPLES:
-                    log.debug("AudioIn callback got %s samples, expected %s", data.shape[0], FRAME_SAMPLES)
+                    orig = data.shape[0]
+                    if data.shape[0] > FRAME_SAMPLES:
+                        data = data[:FRAME_SAMPLES].copy()
+                    else:
+                        data = np.pad(data, (0, FRAME_SAMPLES - data.shape[0])).astype(np.int16, copy=False)
+                    log.debug("AudioIn callback normalized %s -> %s samples", orig, FRAME_SAMPLES)
             except BaseException as e:
                 # Never raise from callback — would become CFFI "Exception ignored"
                 log.exception("AudioIn callback failed: %s", e)

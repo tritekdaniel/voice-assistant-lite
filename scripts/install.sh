@@ -71,24 +71,48 @@ if ! "$PIP" install --no-cache-dir -e "$ROOT" --upgrade; then
     exit 1
   }
 fi
-# Optional: piper voices (heavy, 34MB + native build). Linux often has no wheel -> source build OOMs 32GB and crashes.
-# Install only if requested, never crash host, and never build from source on Linux.
-for a in "$@"; do case "$a" in --with-piper)
-  echo "Installing piper voices (--with-piper) ..."
-  if grep -q "Linux" /proc/version 2>/dev/null; then
-    echo "Linux: piper install is binary-only (source build OOMs). Trying --only-binary..."
-    if "$PIP" install --no-cache-dir --only-binary=:all: -e "$ROOT[piper]" --upgrade 2>&1 | tail -20; then
-      echo "piper installed (binary)"
+# Piper voices (34MB, optional) — try to install by default, but never build from source on Linux (kicks).
+# On Linux, piper-tts often has no wheel for this Python/manylinux -> source build OOMs and kicks to login, so use binary-only.
+# This block never crashes the host (set -e is bypassed).
+_should_try_piper=1
+for a in "$@"; do case "$a" in --no-piper) _should_try_piper=0; break;; --with-piper) _should_try_piper=1; break;; esac; done
+# Also respect --no-piper to skip entirely
+if [ "$_should_try_piper" -eq 1 ]; then
+  if ! "$PYV" -c "import piper" 2>/dev/null; then
+    echo "Installing piper-tts (for GLaDOS/custom voices) ..."
+    if grep -q "Linux" /proc/version 2>/dev/null; then
+      echo "Linux: piper install binary-only (source build kicks to login)..."
+      if "$PIP" install --no-cache-dir --only-binary=:all: -e "$ROOT[piper]" --upgrade 2>&1 | tail -30; then
+        echo "piper installed (binary)"
+      else
+        echo "piper binary not available for this Linux/Python — piper will stay unavailable (kokoro will still work)."
+        echo "To try source build (may kick): .venv/bin/pip install --no-cache-dir piper-tts  or  bash scripts/install.sh --with-piper"
+      fi
     else
-      echo "piper binary not available for this Linux/Python — skipping piper (kokoro will still work)."
-      echo "Tip: use kokoro (default) or build piper manually: pip install --no-build-isolation piper-tts"
+      "$PIP" install --no-cache-dir -e "$ROOT[piper]" --upgrade 2>&1 | tail -20 || echo "piper install failed — kokoro will still work"
     fi
   else
-    "$PIP" install --no-cache-dir -e "$ROOT[piper]" --upgrade || echo "piper install failed — kokoro will still work"
+    echo "piper already installed — skipping"
+  fi
+else
+  echo "Skipping piper (--no-piper)"
+fi
+# Explicit --with-piper forces install (even from source on Linux, may kick to login — user asked for it)
+for a in "$@"; do case "$a" in --with-piper)
+  if "$PYV" -c "import piper" 2>/dev/null; then echo "piper already installed"; break; fi
+  echo "Installing piper voices (--with-piper, may build from source on Linux) ..."
+  if grep -q "Linux" /proc/version 2>/dev/null; then
+    if ! "$PIP" install --no-cache-dir --only-binary=:all: -e "$ROOT[piper]" --upgrade 2>&1 | tail -30; then
+      echo "Binary not available — trying source build with nice (may be heavy, not OOM)..."
+      if ! nice -n 19 "$PIP" install --no-cache-dir --no-build-isolation -e "$ROOT[piper]" --upgrade 2>&1 | tail -30; then
+        echo "piper source build failed — kokoro will still work. Try: pip install piper-tts --no-cache-dir"
+      fi
+    fi
+  else
+    "$PIP" install --no-cache-dir -e "$ROOT[piper]" --upgrade 2>&1 | tail -20 || echo "piper install failed"
   fi
   break;;
 esac; done
-# Never auto-install piper on Linux without --with-piper — it crashes 32GB on source build
 
 # 6. standalone binary — on Linux, never build by default (it previously kicked the user to login).
 # PyInstaller with kokoro+whisper can still take the desktop down even on 32GB (strip/UPX/fork).

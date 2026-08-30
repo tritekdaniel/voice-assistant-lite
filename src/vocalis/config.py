@@ -58,7 +58,7 @@ def apply_model_env() -> None:
 @dataclass
 class Config:
     llm_base_url: str = "http://localhost:11434/v1"
-    llm_model: str = "llama3.2"
+    llm_model: str = ""  # no hardcoded default — user picks via Refresh or types
     llm_api_key: str = ""  # optional — leave empty for local Ollama/LM Studio/Unsloth
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     temperature: float = 0.7

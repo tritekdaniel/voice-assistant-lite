@@ -140,6 +140,14 @@ class PiperSpeaker:
         if length_scale is not None:
             self.length_scale = float(length_scale)
 
+    def _is_valid_piper_config(self, p: Path) -> bool:
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            # valid piper configs have num_symbols + audio.sample_rate + phoneme_id_map
+            return isinstance(data, dict) and "num_symbols" in data and "audio" in data
+        except Exception:
+            return False
+
     def _resolve_paths(self) -> tuple[Path, Path | None]:
         if not self.model_path:
             raise ValueError("Piper model path is not set — choose a .onnx file in Settings")
@@ -149,20 +157,29 @@ class PiperSpeaker:
         if m.suffix.lower() != ".onnx":
             raise ValueError(f"Piper model must be a .onnx file, got: {m}")
         c: Path | None = None
+        # sibling candidates (always valid piper configs if they exist)
+        cj = Path(str(m) + ".json")
+        alt = m.with_suffix(".json")
+        sibling: Path | None = cj if cj.exists() else (alt if alt.exists() else None)
         if self.config_path:
-            c = Path(self.config_path).expanduser()
-            if not c.exists():
-                raise FileNotFoundError(f"Piper config not found: {c}")
+            cand = Path(self.config_path).expanduser()
+            if not cand.exists():
+                raise FileNotFoundError(f"Piper config not found: {cand}")
+            if self._is_valid_piper_config(cand):
+                c = cand
+            else:
+                # Provided config is not a valid piper config (e.g. glados.json without num_symbols)
+                # Fall back to sibling if available, otherwise keep cand and let load fail with clear message
+                if sibling is not None and self._is_valid_piper_config(sibling):
+                    log.warning("Piper config %s is not a valid piper voice config (missing num_symbols) — using sibling %s", cand, sibling)
+                    c = sibling
+                else:
+                    log.warning("Piper config %s looks invalid (missing num_symbols) — will try it anyway", cand)
+                    c = cand
         else:
             # auto .onnx.json
-            cj = Path(str(m) + ".json")
-            if cj.exists():
-                c = cj
-            else:
-                # also try without double ext: model.json
-                alt = m.with_suffix(".json")
-                if alt.exists():
-                    c = alt
+            if sibling is not None:
+                c = sibling
         return m, c
 
     def ensure_loaded(self) -> None:
@@ -184,15 +201,46 @@ class PiperSpeaker:
             raise RuntimeError("piper-tts is not installed. Run: pip install piper-tts") from e
 
         log.info("Loading Piper voice model=%s config=%s speaker=%s", m, c, self.speaker_id)
+        last_exc: BaseException | None = None
+        # Try primary config first, then sibling fallback if KeyError num_symbols or similar
+        candidates: list[Path | None] = [c]
+        # add sibling as fallback if different from primary
         try:
-            # PiperVoice.load handles both onnx+ json
-            self._voice = PiperVoice.load(str(m), config_path=str(c) if c else None, use_cuda=False)
-            self._sample_rate = int(getattr(getattr(self._voice, "config", None), "sample_rate", 22050))
-            log.info("Piper voice ready sr=%s speakers=%s", self._sample_rate, getattr(self._voice.config, "num_speakers", "?"))
-        except BaseException as e:
-            log.exception("Piper load failed %s: %s", m, e)
-            raise
-        _PIPER_CACHE[key] = self._voice
+            sib = Path(str(m) + ".json")
+            if sib.exists() and sib != c:
+                candidates.append(sib)
+            alt2 = m.with_suffix(".json")
+            if alt2.exists() and alt2 not in candidates:
+                candidates.append(alt2)
+        except Exception:
+            pass
+        for cand in candidates:
+            try:
+                self._voice = PiperVoice.load(str(m), config_path=str(cand) if cand else None, use_cuda=False)
+                self._sample_rate = int(getattr(getattr(self._voice, "config", None), "sample_rate", 22050))
+                if cand != c:
+                    log.info("Piper voice ready with fallback config %s sr=%s speakers=%s", cand, self._sample_rate, getattr(self._voice.config, "num_speakers", "?"))
+                else:
+                    log.info("Piper voice ready sr=%s speakers=%s", self._sample_rate, getattr(self._voice.config, "num_speakers", "?"))
+                _PIPER_CACHE[key] = self._voice
+                return
+            except (KeyError, ValueError, FileNotFoundError) as e:
+                last_exc = e
+                # Config mismatch like 'num_symbols' — try next candidate
+                if cand is not None and "num_symbols" in str(e) or isinstance(e, KeyError):
+                    log.warning("Piper load with config %s failed (%s) — trying fallback", cand, e)
+                    continue
+                # For other errors, don't retry
+                log.exception("Piper load failed %s: %s", m, e)
+                raise
+            except BaseException as e:
+                last_exc = e
+                log.exception("Piper load failed %s: %s", m, e)
+                raise
+        # All candidates failed — raise last
+        if last_exc is not None:
+            raise RuntimeError(f"Piper voice {m.name} failed to load with config {c} (tried {candidates}): {last_exc}. Ensure the .onnx and its matching .onnx.json are a valid piper voice pair (download from rhasspy/piper-voices).") from last_exc
+        raise RuntimeError(f"Piper voice {m} failed to load — no valid config found")
 
     def synthesize(self, text: str) -> np.ndarray:
         self.ensure_loaded()

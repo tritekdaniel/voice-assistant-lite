@@ -148,12 +148,51 @@ class PiperSpeaker:
         except Exception:
             return False
 
+    def _find_file(self, raw: str) -> Path | None:
+        """Robustly find a file on Linux/Windows: strip quotes, expanduser, try sibling dirs."""
+        s = (raw or "").strip().strip('"').strip("'").strip()
+        if not s:
+            return None
+        # Try exact, expanduser, resolve
+        for cand in [Path(s), Path(s).expanduser(), Path(s).expanduser().resolve()]:
+            try:
+                if cand.exists() and cand.is_file():
+                    return cand
+            except Exception:
+                continue
+        # Try case-insensitive parent listing (Linux is case-sensitive, user may have typo)
+        try:
+            p = Path(s).expanduser()
+            parent = p.parent if p.parent != Path("") else Path(".")
+            if parent.exists():
+                # list dir and try case-insensitive match
+                name_lower = p.name.lower()
+                for child in parent.iterdir():
+                    if child.name.lower() == name_lower and child.is_file():
+                        log.info("Found piper file via case-insensitive match: %s -> %s", s, child)
+                        return child
+        except Exception:
+            pass
+        return None
+
     def _resolve_paths(self) -> tuple[Path, Path | None]:
         if not self.model_path:
             raise ValueError("Piper model path is not set — choose a .onnx file in Settings")
-        m = Path(self.model_path).expanduser()
-        if not m.exists():
-            raise FileNotFoundError(f"Piper model not found: {m}")
+        # Robust find: handle quotes, ~, case, etc.
+        m = self._find_file(self.model_path)
+        if m is None:
+            # Provide helpful diagnostic: list parent dir
+            raw = self.model_path.strip().strip('"').strip("'")
+            try:
+                parent = Path(raw).expanduser().parent
+                listing = ""
+                if parent.exists():
+                    listing = ", ".join(p.name for p in parent.iterdir() if p.is_file())[:500]
+                else:
+                    listing = f"parent {parent} does not exist"
+            except Exception as e:
+                listing = str(e)
+            raise FileNotFoundError(f"Piper model not found: {raw} (tried {m}); parent contains: {listing}")
         if m.suffix.lower() != ".onnx":
             raise ValueError(f"Piper model must be a .onnx file, got: {m}")
         c: Path | None = None
@@ -161,15 +200,14 @@ class PiperSpeaker:
         cj = Path(str(m) + ".json")
         alt = m.with_suffix(".json")
         sibling: Path | None = cj if cj.exists() else (alt if alt.exists() else None)
-        if self.config_path:
-            cand = Path(self.config_path).expanduser()
-            if not cand.exists():
-                raise FileNotFoundError(f"Piper config not found: {cand}")
+        if self.config_path and self.config_path.strip():
+            cand = self._find_file(self.config_path)
+            if cand is None:
+                raw_c = self.config_path.strip().strip('"').strip("'")
+                raise FileNotFoundError(f"Piper config not found: {raw_c}")
             if self._is_valid_piper_config(cand):
                 c = cand
             else:
-                # Provided config is not a valid piper config (e.g. glados.json without num_symbols)
-                # Fall back to sibling if available, otherwise keep cand and let load fail with clear message
                 if sibling is not None and self._is_valid_piper_config(sibling):
                     log.warning("Piper config %s is not a valid piper voice config (missing num_symbols) — using sibling %s", cand, sibling)
                     c = sibling
@@ -177,9 +215,11 @@ class PiperSpeaker:
                     log.warning("Piper config %s looks invalid (missing num_symbols) — will try it anyway", cand)
                     c = cand
         else:
-            # auto .onnx.json
             if sibling is not None:
                 c = sibling
+            else:
+                # No sibling found — will let PiperVoice.load try with no config and fail with clear message
+                log.warning("No sibling .json found for %s (tried %s and %s)", m, cj, alt)
         return m, c
 
     def ensure_loaded(self) -> None:
@@ -302,20 +342,48 @@ def create_speaker(cfg) -> Speaker | PiperSpeaker:
     """
     engine = str(getattr(cfg, "tts_engine", "kokoro")).lower()
     if engine == "piper":
-        model = (getattr(cfg, "piper_model", "") or "").strip()
+        model = (getattr(cfg, "piper_model", "") or "").strip().strip('"').strip("'")
         # If no model configured, fall back to kokoro (don't crash)
         if not model:
             log.warning("TTS engine piper selected but piper_model is empty — falling back to kokoro")
             engine = "kokoro"
         else:
-            # Check piper is importable and model exists before returning PiperSpeaker
+            # Check piper is importable and model exists (robust, handles Linux case, quotes, ~)
             try:
                 import importlib.util
                 if importlib.util.find_spec("piper") is None:
-                    raise ImportError("piper not installed")
+                    raise ImportError("piper not installed — run pip install piper-tts")
                 from pathlib import Path
-                if not Path(model).expanduser().exists():
-                    raise FileNotFoundError(f"piper model not found: {model}")
+
+                def _exists_robust(p: str) -> bool:
+                    s = p.strip().strip('"').strip("'")
+                    for cand in [Path(s), Path(s).expanduser(), Path(s).expanduser().resolve()]:
+                        try:
+                            if cand.exists() and cand.is_file():
+                                return True
+                        except Exception:
+                            continue
+                    # case-insensitive parent search (Linux)
+                    try:
+                        pp = Path(s).expanduser()
+                        parent = pp.parent if str(pp.parent) not in ("", ".") else Path(".")
+                        if parent.exists():
+                            low = pp.name.lower()
+                            for child in parent.iterdir():
+                                if child.name.lower() == low and child.is_file():
+                                    return True
+                    except Exception:
+                        pass
+                    return False
+
+                if not _exists_robust(model):
+                    # Try common fallback: ~/Downloads basename
+                    base = Path(model).name
+                    fallback = Path.home() / "Downloads" / base
+                    if fallback.exists():
+                        log.info("Piper model %s not found, using fallback %s", model, fallback)
+                    else:
+                        raise FileNotFoundError(f"piper model not found: {model} (also tried {fallback})")
             except Exception as e:
                 log.warning("Piper not available (%s) — falling back to kokoro", e)
                 engine = "kokoro"

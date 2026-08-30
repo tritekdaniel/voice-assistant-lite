@@ -157,15 +157,11 @@ def load_config() -> Config:
             raw["system_prompt"] = DEFAULT_SYSTEM_PROMPT
     cfg = Config(**{k: v for k, v in raw.items() if k in known})
     cfg.llm_model = _norm_model_id(cfg.llm_model)
-    # Ensure llm_model is never empty — fallback to default for the base_url
+    # Don't force a default if empty — let the UI show hints and let the user pick.
+    # The default Config(llm_model="llama3.2") is already used for fresh installs.
     if not cfg.llm_model:
-        # Guess default based on base_url (Ollama vs LM Studio)
-        if "1234" in cfg.llm_base_url or "lm-studio" in cfg.llm_base_url.lower():
-            cfg.llm_model = "openai/gpt-oss-20b"  # generic LM Studio default, will be validated via list_models
-        elif "8080" in cfg.llm_base_url:
-            cfg.llm_model = "unsloth/Llama-3.2-1B-Instruct"
-        else:
-            cfg.llm_model = "llama3.2"
+        # Keep empty so Settings shows placeholder + hints; will be validated on save
+        cfg.llm_model = ""
     if cfg.llm_api_key.strip() in ("vocalis-local", "ollama", "lm-studio", "unsloth", "none"):
         cfg.llm_api_key = ""
     if cfg.system_prompt.strip() == _old_prompt.strip() or _old_with_lithium in cfg.system_prompt:

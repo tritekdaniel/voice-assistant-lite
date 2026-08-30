@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 
 from .logger import get_logger
@@ -7,6 +10,18 @@ from .logger import get_logger
 log = get_logger(__name__)
 
 _cache: dict[str, object] = {}
+
+
+def _resample_to_out_rate(data: np.ndarray, sr_in: int, sr_out: int = 24000) -> np.ndarray:
+    if sr_in == sr_out or len(data) == 0:
+        return data.astype(np.float32, copy=False)
+    ratio = sr_out / sr_in
+    new_len = int(len(data) * ratio)
+    if new_len == 0:
+        return np.zeros(0, dtype=np.float32)
+    old_idx = np.arange(len(data))
+    new_idx = np.linspace(0, len(data) - 1, new_len)
+    return np.interp(new_idx, old_idx, data).astype(np.float32)
 
 
 class Speaker:
@@ -80,3 +95,171 @@ class Speaker:
         out = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
         log.debug("TTS produced %d samples (%.2fs) for %r", len(out), len(out)/24000 if len(out) else 0, text[:40])
         return out
+
+
+# ---------- Piper ----------
+
+_PIPER_CACHE: dict[str, object] = {}
+
+
+class PiperSpeaker:
+    """Piper TTS (onnx + json). Supports any Piper voice with custom .onnx.
+
+    Sample rate is taken from the voice config (typically 22050) and resampled to 24 kHz
+    so it can share the same Playback (OUT_RATE=24000).
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        config_path: str = "",
+        speaker_id: int = 0,
+        length_scale: float = 1.0,
+        noise_scale: float = 0.667,
+        noise_w: float = 0.8,
+    ):
+        self.model_path = (model_path or "").strip()
+        self.config_path = (config_path or "").strip()
+        self.speaker_id = int(speaker_id)
+        self.length_scale = float(length_scale)
+        self.noise_scale = float(noise_scale)
+        self.noise_w = float(noise_w)
+        self._voice = None
+        self._sample_rate = 22050
+
+    def reconfigure(
+        self,
+        model_path: str = "",
+        speaker_id: int | None = None,
+        length_scale: float | None = None,
+    ) -> None:
+        if model_path:
+            self.model_path = model_path.strip()
+        if speaker_id is not None:
+            self.speaker_id = int(speaker_id)
+        if length_scale is not None:
+            self.length_scale = float(length_scale)
+
+    def _resolve_paths(self) -> tuple[Path, Path | None]:
+        if not self.model_path:
+            raise ValueError("Piper model path is not set — choose a .onnx file in Settings")
+        m = Path(self.model_path).expanduser()
+        if not m.exists():
+            raise FileNotFoundError(f"Piper model not found: {m}")
+        if m.suffix.lower() != ".onnx":
+            raise ValueError(f"Piper model must be a .onnx file, got: {m}")
+        c: Path | None = None
+        if self.config_path:
+            c = Path(self.config_path).expanduser()
+            if not c.exists():
+                raise FileNotFoundError(f"Piper config not found: {c}")
+        else:
+            # auto .onnx.json
+            cj = Path(str(m) + ".json")
+            if cj.exists():
+                c = cj
+            else:
+                # also try without double ext: model.json
+                alt = m.with_suffix(".json")
+                if alt.exists():
+                    c = alt
+        return m, c
+
+    def ensure_loaded(self) -> None:
+        m, c = self._resolve_paths()
+        key = f"{m}|{c}|{self.speaker_id}"
+        cached = _PIPER_CACHE.get(key)
+        if cached is not None and self._voice is not None:
+            return
+        if cached is not None:
+            self._voice = cached
+            try:
+                self._sample_rate = int(getattr(getattr(cached, "config", None), "sample_rate", 22050))
+            except Exception:
+                pass
+            return
+        try:
+            from piper import PiperVoice
+        except ImportError as e:
+            raise RuntimeError("piper-tts is not installed. Run: pip install piper-tts") from e
+
+        log.info("Loading Piper voice model=%s config=%s speaker=%s", m, c, self.speaker_id)
+        try:
+            # PiperVoice.load handles both onnx+ json
+            self._voice = PiperVoice.load(str(m), config_path=str(c) if c else None, use_cuda=False)
+            self._sample_rate = int(getattr(getattr(self._voice, "config", None), "sample_rate", 22050))
+            log.info("Piper voice ready sr=%s speakers=%s", self._sample_rate, getattr(self._voice.config, "num_speakers", "?"))
+        except BaseException as e:
+            log.exception("Piper load failed %s: %s", m, e)
+            raise
+        _PIPER_CACHE[key] = self._voice
+
+    def synthesize(self, text: str) -> np.ndarray:
+        self.ensure_loaded()
+        assert self._voice is not None
+        log.debug("Piper synthesize model=%s speaker=%s len=%.2f text=%r", Path(self.model_path).name, self.speaker_id, self.length_scale, text[:80])
+        try:
+            from piper.config import SynthesisConfig
+        except ImportError:
+            SynthesisConfig = None  # type: ignore
+
+        # Build synthesis config
+        syn_cfg = None
+        if SynthesisConfig is not None:
+            try:
+                syn_cfg = SynthesisConfig(
+                    speaker_id=self.speaker_id if getattr(self._voice.config, "num_speakers", 1) > 1 else None,
+                    length_scale=self.length_scale if self.length_scale != 1.0 else None,
+                    noise_scale=self.noise_scale if self.noise_scale != 0.667 else None,
+                    noise_w_scale=self.noise_w if self.noise_w != 0.8 else None,
+                )
+            except Exception:
+                syn_cfg = None
+
+        parts: list[np.ndarray] = []
+        sr = self._sample_rate
+        try:
+            gen = self._voice.synthesize(text, syn_config=syn_cfg)  # type: ignore[arg-type]
+            for chunk in gen:
+                # chunk is AudioChunk
+                arr = getattr(chunk, "audio_float_array", None)
+                if arr is None:
+                    # fallback: try int16
+                    arr = getattr(chunk, "audio_int16_array", None)
+                    if arr is not None:
+                        arr = np.asarray(arr, dtype=np.float32) / 32768.0
+                    else:
+                        arr = np.asarray(chunk, dtype=np.float32)
+                else:
+                    arr = np.asarray(arr, dtype=np.float32)
+                if len(arr) == 0:
+                    continue
+                # Piper chunk sr -> OUT_RATE
+                if sr != 24000:
+                    arr = _resample_to_out_rate(arr, sr, 24000)
+                parts.append(np.ascontiguousarray(arr, dtype=np.float32))
+        except BaseException as e:
+            log.exception("Piper synthesize failed %r: %s", text[:80], e)
+            raise
+        out = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+        log.debug("Piper produced %d samples (%.2fs) for %r", len(out), len(out)/24000 if len(out) else 0, text[:40])
+        return out
+
+
+def create_speaker(cfg) -> Speaker | PiperSpeaker:
+    """Factory: return Kokoro Speaker or PiperSpeaker based on cfg.tts_engine."""
+    engine = getattr(cfg, "tts_engine", "kokoro")
+    if str(engine).lower() == "piper":
+        return PiperSpeaker(
+            model_path=getattr(cfg, "piper_model", ""),
+            config_path=getattr(cfg, "piper_config", ""),
+            speaker_id=int(getattr(cfg, "piper_speaker", 0) or 0),
+            length_scale=float(getattr(cfg, "piper_length_scale", 1.0) or 1.0),
+            noise_scale=float(getattr(cfg, "piper_noise_scale", 0.667) or 0.667),
+            noise_w=float(getattr(cfg, "piper_noise_w", 0.8) or 0.8),
+        )
+    # default kokoro
+    return Speaker(
+        voice=getattr(cfg, "tts_voice", "af_heart"),
+        speed=float(getattr(cfg, "tts_speed", 1.0) or 1.0),
+    )

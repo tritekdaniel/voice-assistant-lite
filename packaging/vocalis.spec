@@ -27,6 +27,7 @@ hidden = []
 hidden += collect_submodules("faster_whisper")
 hidden += collect_submodules("openwakeword")
 hidden += collect_submodules("kokoro")
+hidden += collect_submodules("piper")
 hidden += collect_submodules("sounddevice")
 # scipy: only the bits openwakeword actually uses (signal/special), not the whole 200-module tree
 for _m in ("scipy.signal", "scipy.special", "scipy.linalg", "scipy.spatial"):
@@ -74,6 +75,11 @@ except Exception:
 # soundfile/miniaudio data (if any)
 try:
     datas += collect_data_files("soundfile", include_py_files=False)
+except Exception:
+    pass
+# piper espeak-ng data and voices (needed for Piper TTS)
+try:
+    datas += collect_data_files("piper", include_py_files=False)
 except Exception:
     pass
 

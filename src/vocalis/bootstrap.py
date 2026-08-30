@@ -11,11 +11,13 @@ def ensure_models(cfg, status) -> None:
     """Load (and on first run download) every model. Components are cached so a
     later Session rebuild is instant."""
     from .stt import Transcriber
-    from .tts import Speaker
+    from .tts import create_speaker
     from .wakeword import WakeWord
 
     t0 = time.monotonic()
-    log.info("Bootstrap start: wake=%s whisper=%s voice=%s", cfg.wake_word, cfg.whisper_model, cfg.tts_voice)
+    eng = getattr(cfg, "tts_engine", "kokoro")
+    voice_info = getattr(cfg, "piper_model", "") if eng == "piper" else getattr(cfg, "tts_voice", "af_heart")
+    log.info("Bootstrap start: wake=%s whisper=%s tts=%s voice=%s", cfg.wake_word, cfg.whisper_model, eng, voice_info)
     status("wake", "Loading wake word model...")
     ww = WakeWord(cfg.wake_word, cfg.wakeword_threshold,
                  cfg.wakeword_cooldown_ms, cfg.wakeword_embeddings)
@@ -35,14 +37,24 @@ def ensure_models(cfg, status) -> None:
         log.exception("Bootstrap whisper failed: %s", e)
         raise RuntimeError(f"Whisper model '{cfg.whisper_model}' could not be loaded: {e}") from e
 
-    status("tts", "Loading Kokoro-82M...")
-    spk = Speaker(cfg.tts_voice, cfg.tts_speed)
+    eng = getattr(cfg, "tts_engine", "kokoro")
+    if eng == "piper":
+        status("tts", "Loading Piper...")
+    else:
+        status("tts", "Loading Kokoro-82M...")
+    try:
+        from .tts import create_speaker as _cs
+        spk = _cs(cfg)
+    except Exception:
+        from .tts import Speaker as _Sp
+        spk = _Sp(cfg.tts_voice, cfg.tts_speed)
     try:
         spk.ensure_loaded()
-        log.info("Bootstrap tts OK")
+        log.info("Bootstrap tts OK engine=%s", eng)
     except BaseException as e:  # noqa: BLE001
         log.exception("Bootstrap tts failed: %s", e)
-        raise RuntimeError(f"Kokoro-82M could not be loaded: {e}") from e
+        label = "Piper" if eng == "piper" else "Kokoro-82M"
+        raise RuntimeError(f"{label} could not be loaded: {e}") from e
 
     elapsed = time.monotonic() - t0
     log.info("Bootstrap done in %.1fs", elapsed)

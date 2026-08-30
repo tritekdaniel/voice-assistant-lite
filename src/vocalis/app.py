@@ -535,8 +535,25 @@ class SettingsDialog(QDialog):
         self._test_signals.sig_models_ok.connect(self._on_models_ok)
         self._test_signals.sig_models_err.connect(self._on_models_err)
 
-        # Voice — expanded list, with faster/slower guidance (Kokoro is single 82M model; speed = pacing)
-        form2 = QFormLayout()
+        # TTS Engine — Kokoro vs Piper (custom voices)
+        from PySide6.QtWidgets import QCheckBox  # local for type checkers
+        engine_form = QFormLayout()
+        engine_form.setLabelAlignment(Qt.AlignRight)
+        self._tts_engine = QComboBox()
+        self._tts_engine.addItems(["kokoro", "piper"])
+        cur_eng = getattr(cfg, "tts_engine", "kokoro")
+        if cur_eng not in ("kokoro", "piper"):
+            cur_eng = "kokoro"
+        self._tts_engine.setCurrentText(cur_eng)
+        self._tts_engine.setToolTip("kokoro = 82M built-in voices; piper = local .onnx custom voices (e.g. GLaDOS)")
+        engine_form.addRow("TTS engine", self._tts_engine)
+        lay.addLayout(engine_form)
+
+        # Kokoro controls (shown when engine==kokoro)
+        self._kokoro_frame = QFrame()
+        self._kokoro_frame.setStyleSheet("QFrame{border:none;}")
+        kf_lay = QFormLayout(self._kokoro_frame)
+        kf_lay.setContentsMargins(0, 0, 0, 0)
         self._voice = QComboBox()
         self._voice.setEditable(True)
         for v in VOICES:
@@ -546,28 +563,73 @@ class SettingsDialog(QDialog):
         if idx >= 0:
             self._voice.setCurrentIndex(idx)
         else:
-            # custom voice not in list
             self._voice.addItem(cfg.tts_voice, cfg.tts_voice)
             self._voice.setCurrentIndex(self._voice.count() - 1)
         self._voice.setToolTip("Kokoro 82M — voice doesn't change model size; use Speed for faster/slower. 'a'=American, 'b'=British.")
-        form2.addRow("Voice", self._voice)
+        kf_lay.addRow("Voice", self._voice)
         self._lbl_voice_info = QLabel(VOICE_INFO.get(cfg.tts_voice, "Tip: speed 1.5–2.0 is faster; 0.8–1.0 is more natural."))
         self._lbl_voice_info.setStyleSheet("color:#64748b; font-size:11px;")
         self._lbl_voice_info.setWordWrap(True)
-        form2.addRow("", self._lbl_voice_info)
+        kf_lay.addRow("", self._lbl_voice_info)
         self._voice.currentIndexChanged.connect(self._on_voice_changed)
-        # also handle free-typed text
         if self._voice.lineEdit():
             self._voice.lineEdit().textChanged.connect(lambda t: self._on_voice_changed(-1))
-
         self._speed = QDoubleSpinBox()
         self._speed.setRange(0.5, 2.0)
         self._speed.setSingleStep(0.05)
         self._speed.setValue(float(cfg.tts_speed))
         self._speed.setToolTip("1.0 = normal, 1.5–1.8 = noticeably faster, 0.8 = slower/more natural")
-        form2.addRow("Speed", self._speed)
+        kf_lay.addRow("Speed", self._speed)
+        lay.addWidget(self._kokoro_frame)
 
-        lay.addLayout(form2)
+        # Piper controls (shown when engine==piper)
+        self._piper_frame = QFrame()
+        self._piper_frame.setStyleSheet("QFrame{border:none;}")
+        pf_lay = QFormLayout(self._piper_frame)
+        pf_lay.setContentsMargins(0, 0, 0, 0)
+        # Model path
+        self._piper_model = QLineEdit(getattr(cfg, "piper_model", "") or "")
+        self._piper_model.setPlaceholderText("Path to .onnx voice (e.g. en_US-lessac-medium.onnx)")
+        self._piper_model.setToolTip("Piper voice model .onnx — comes with a .onnx.json config (auto-found)")
+        pf_lay.addRow("Piper model (.onnx)", self._piper_model)
+        self._btn_piper_browse = QPushButton("Browse .onnx…")
+        self._btn_piper_browse.setToolTip("Choose a Piper voice .onnx (its .onnx.json will be auto-loaded)")
+        self._btn_piper_browse.clicked.connect(self._browse_piper_model)
+        pf_lay.addRow("", self._btn_piper_browse)
+        # Config override (optional)
+        self._piper_config = QLineEdit(getattr(cfg, "piper_config", "") or "")
+        self._piper_config.setPlaceholderText("Optional .onnx.json (auto if empty)")
+        self._piper_config.setToolTip("Leave empty to use <model>.json next to the .onnx")
+        pf_lay.addRow("Piper config (.json)", self._piper_config)
+        self._btn_piper_cfg_browse = QPushButton("Browse .json…")
+        self._btn_piper_cfg_browse.clicked.connect(self._browse_piper_config)
+        pf_lay.addRow("", self._btn_piper_cfg_browse)
+        # Speaker & prosody
+        self._piper_speaker = QSpinBox()
+        self._piper_speaker.setRange(0, 32)
+        self._piper_speaker.setValue(int(getattr(cfg, "piper_speaker", 0) or 0))
+        self._piper_speaker.setToolTip("Speaker id for multi-speaker models (0 = default)")
+        pf_lay.addRow("Speaker id", self._piper_speaker)
+        self._piper_length = QDoubleSpinBox()
+        self._piper_length.setRange(0.3, 3.0)
+        self._piper_length.setSingleStep(0.05)
+        self._piper_length.setValue(float(getattr(cfg, "piper_length_scale", 1.0) or 1.0))
+        self._piper_length.setToolTip("Length scale: <1 faster, >1 slower (Piper)")
+        pf_lay.addRow("Length scale", self._piper_length)
+        self._lbl_piper_info = QLabel("Piper voices are local .onnx files — drop any voice (e.g. GLaDOS, Darth Maul via community voices) into a folder and browse to it. No download needed.")
+        self._lbl_piper_info.setStyleSheet("color:#64748b; font-size:11px;")
+        self._lbl_piper_info.setWordWrap(True)
+        pf_lay.addRow("", self._lbl_piper_info)
+        lay.addWidget(self._piper_frame)
+
+        # Toggle frames by engine
+        def _update_tts_frames():
+            is_piper = self._tts_engine.currentText() == "piper"
+            self._kokoro_frame.setVisible(not is_piper)
+            self._piper_frame.setVisible(is_piper)
+        self._tts_engine.currentTextChanged.connect(lambda _: _update_tts_frames())
+        _update_tts_frames()
+
         row_tts = QHBoxLayout()
         self._btn_tts = QPushButton("Speak test")
         self._btn_tts.clicked.connect(self._do_tts_test)
@@ -944,16 +1006,31 @@ class SettingsDialog(QDialog):
     def _do_tts_test(self) -> None:
         self._btn_tts.setEnabled(False)
         self._lbl_tts.setText("Synthesizing…")
-        v_data = self._voice.currentData()
-        voice = (v_data if isinstance(v_data, str) and v_data else self._voice.currentText().split(" —")[0].strip()) or "af_heart"
-        speed = float(self._speed.value())
+        engine = self._tts_engine.currentText().strip() or "kokoro"
         out_dev = self._out_dev.currentData()
+        # capture UI values for worker (avoid cross-thread UI access)
+        if engine == "piper":
+            piper_model = self._piper_model.text().strip()
+            piper_config = self._piper_config.text().strip()
+            piper_speaker = int(self._piper_speaker.value())
+            piper_len = float(self._piper_length.value())
+            voice_label = Path(piper_model).name if piper_model else "piper"
+            def _make_spk():
+                from .tts import PiperSpeaker
+                return PiperSpeaker(piper_model, piper_config, piper_speaker, piper_len)
+        else:
+            v_data = self._voice.currentData()
+            voice = (v_data if isinstance(v_data, str) and v_data else self._voice.currentText().split(" —")[0].strip()) or "af_heart"
+            speed = float(self._speed.value())
+            voice_label = voice
+            def _make_spk():
+                from .tts import Speaker
+                return Speaker(voice, speed)
 
         def worker():
             try:
-                from .tts import Speaker
                 from .audio_io import Playback
-                spk = Speaker(voice, speed)
+                spk = _make_spk()
                 audio = spk.synthesize("This is how I sound.")
                 if len(audio) == 0:
                     self._test_signals.sig_tts.emit("No audio produced")
@@ -966,7 +1043,7 @@ class SettingsDialog(QDialog):
                         break
                     time.sleep(0.1)
                 pb.stop()
-                self._test_signals.sig_tts.emit(f"Played {len(audio)/24000:.1f}s on {voice}")
+                self._test_signals.sig_tts.emit(f"Played {len(audio)/24000:.1f}s on {voice_label} ({engine})")
             except Exception as e:
                 self._test_signals.sig_tts.emit(f"Failed: {e}")
 
@@ -1060,6 +1137,20 @@ class SettingsDialog(QDialog):
         except Exception as e:
             QMessageBox.warning(self, "Logs", f"Could not view log: {e}\n\nPath: {log_path()}")
 
+    def _browse_piper_model(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Choose Piper voice", "", "Piper voice (*.onnx);;All files (*.*)")
+        if path:
+            self._piper_model.setText(path)
+            # auto-fill config if sibling exists
+            cfg_candidate = path + ".json"
+            if Path(cfg_candidate).exists() and not self._piper_config.text().strip():
+                self._piper_config.setText(cfg_candidate)
+
+    def _browse_piper_config(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Choose Piper config", "", "JSON (*.json);;All files (*.*)")
+        if path:
+            self._piper_config.setText(path)
+
     def _save(self) -> None:
         c = self.cfg
         c.llm_base_url = self._base_url.text().strip() or c.llm_base_url
@@ -1068,10 +1159,23 @@ class SettingsDialog(QDialog):
         c.llm_api_key = self._api_key.text().strip()
         c.temperature = float(self._temp.value())
         c.system_prompt = self._sys.toPlainText().strip() or c.system_prompt
+        # TTS engine
+        c.tts_engine = self._tts_engine.currentText().strip() or "kokoro"
         # voice/whisper store pure id (from data or split display)
         _v = self._voice.currentData()
         c.tts_voice = (_v if isinstance(_v, str) and _v else self._voice.currentText().split(" —")[0].strip()) or c.tts_voice
         c.tts_speed = float(self._speed.value())
+        # Piper
+        c.piper_model = self._piper_model.text().strip()
+        c.piper_config = self._piper_config.text().strip()
+        try:
+            c.piper_speaker = int(self._piper_speaker.value())
+        except Exception:
+            c.piper_speaker = 0
+        try:
+            c.piper_length_scale = float(self._piper_length.value())
+        except Exception:
+            c.piper_length_scale = 1.0
         c.wake_word = self._wake.currentText().strip() or c.wake_word
         c.wakeword_embeddings = self._wake_emb.text().strip()
         c.wakeword_threshold = float(self._wake_thr.value())

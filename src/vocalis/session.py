@@ -17,7 +17,7 @@ from .sounds import Sounds
 from .stt import Transcriber
 from .textsplit import SentenceBuffer
 from .timer import TimerManager, get_timer_tools
-from .tts import Speaker
+from .tts import Speaker, create_speaker
 from .wakeword import WakeWord
 
 log = get_logger(__name__)
@@ -623,6 +623,14 @@ class SessionFactory:
         # preload will be called in Session.start(), but we can also preload now
         from .sounds import Sounds as _S  # noqa: F811
         timer = TimerManager(sounds)
+        # TTS: kokoro or piper via factory
+        try:
+            tts = create_speaker(self.cfg)  # type: ignore[assignment]
+        except Exception as e:
+            # fallback to kokoro if piper not available / misconfigured
+            from .logger import get_logger
+            get_logger(__name__).warning("TTS factory failed (%s), falling back to kokoro", e)
+            tts = Speaker(getattr(self.cfg, "tts_voice", "af_heart"), float(getattr(self.cfg, "tts_speed", 1.0)))
         return Session(
             self.cfg,
             audio_in,
@@ -634,7 +642,7 @@ class SessionFactory:
                       self.cfg.llm_api_key, self.cfg.temperature),
             History(self.cfg.system_prompt, self.cfg.max_history_messages,
                     compact_after=getattr(self.cfg, "compact_after", 30)),
-            Speaker(self.cfg.tts_voice, self.cfg.tts_speed),
+            tts,
             listener,
             sounds=sounds,
             timer=timer,

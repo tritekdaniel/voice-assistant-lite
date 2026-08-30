@@ -110,6 +110,7 @@ class Sounds:
         self._wake: np.ndarray = np.zeros(0, dtype=np.float32)
         self._finished: np.ndarray = np.zeros(0, dtype=np.float32)
         self._lithium: np.ndarray = np.zeros(0, dtype=np.float32)
+        self._timer_set: np.ndarray = np.zeros(0, dtype=np.float32)
         self._lock = threading.Lock()
         self._timer_stop = threading.Event()
         self._timer_thread: threading.Thread | None = None
@@ -121,7 +122,8 @@ class Sounds:
                 self._wake = _load_asset("wake-up.ogg")
                 self._finished = _load_asset("finished-listening.ogg")
                 self._lithium = _load_asset("Lithium.mp3")
-                log.info("Sounds preloaded: wake %d, finished %d, lithium %d samples", len(self._wake), len(self._finished), len(self._lithium))
+                self._timer_set = _load_asset("timer-set.mp3")
+                log.info("Sounds preloaded: wake %d, finished %d, lithium %d, timer_set %d samples", len(self._wake), len(self._finished), len(self._lithium), len(self._timer_set))
             except Exception as e:
                 log.exception("Sounds preload failed: %s", e)
         t = threading.Thread(target=_load, daemon=True, name="sounds-preload")
@@ -133,6 +135,11 @@ class Sounds:
                 self._wake = _load_asset("wake-up.ogg")
             except Exception:
                 pass
+        if len(self._timer_set) == 0:
+            try:
+                self._timer_set = _load_asset("timer-set.mp3")
+            except Exception:
+                pass
 
     def ensure_loaded(self) -> None:
         if len(self._wake) == 0:
@@ -141,6 +148,8 @@ class Sounds:
             self._finished = _load_asset("finished-listening.ogg")
         if len(self._lithium) == 0:
             self._lithium = _load_asset("Lithium.mp3")
+        if len(self._timer_set) == 0:
+            self._timer_set = _load_asset("timer-set.mp3")
 
     def play_wake(self) -> None:
         self.ensure_loaded()
@@ -159,6 +168,14 @@ class Sounds:
         self.ensure_loaded()
         if len(self._lithium):
             self._playback.put(self._lithium)
+
+    def play_timer_set(self) -> None:
+        self.ensure_loaded()
+        if len(self._timer_set):
+            log.debug("Playing timer-set %d samples", len(self._timer_set))
+            self._playback.put(self._timer_set)
+        else:
+            log.warning("timer-set.mp3 not loaded, skipping")
 
     def play_timer_loop(self, loops: int = 5, gap_ms: int = 200) -> None:
         """Play timer alarm `loops` times with small gaps, cancellable via stop_timer_loop()."""

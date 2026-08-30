@@ -17,6 +17,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--whisper-model", help="faster-whisper model, e.g. base.en small.en medium.en")
     p.add_argument("--voice", help="Kokoro voice id, e.g. af_heart am_adam")
     p.add_argument("--speed", type=float, help="TTS speed 0.5-2.0")
+    p.add_argument("--tts-engine", choices=["kokoro", "piper"], help="TTS engine")
+    p.add_argument("--piper-model", help="Piper voice .onnx path")
     p.add_argument("--wake-word", help="Wake word model name (hey_jarvis) or path to a custom .onnx")
     p.add_argument("--wakeword-threshold", type=float, help="Wake trigger threshold 0.1-0.9")
     p.add_argument("--headless", action="store_true", help="Run without the GUI window")
@@ -39,6 +41,8 @@ def _apply_flags(args, cfg) -> None:
         "whisper_model": args.whisper_model,
         "tts_voice": args.voice,
         "tts_speed": args.speed,
+        "tts_engine": args.tts_engine,
+        "piper_model": args.piper_model,
         "wake_word": args.wake_word,
         "wakeword_threshold": args.wakeword_threshold,
     }
@@ -77,8 +81,9 @@ def main(argv=None) -> int:
 
     log.debug("CLI args: %s", args)
     cfg = load_config()
-    log.info("Config loaded from %s: base_url=%s model=%s whisper=%s voice=%s wake=%s",
-             "config.toml", cfg.llm_base_url, cfg.llm_model, cfg.whisper_model, cfg.tts_voice, cfg.wake_word)
+    tts_info = cfg.piper_model if getattr(cfg, "tts_engine", "kokoro") == "piper" else cfg.tts_voice
+    log.info("Config loaded from %s: base_url=%s model=%s whisper=%s tts=%s voice=%s wake=%s",
+             "config.toml", cfg.llm_base_url, cfg.llm_model, cfg.whisper_model, getattr(cfg, "tts_engine", "kokoro"), tts_info, cfg.wake_word)
     if _apply_flags(args, cfg):
         save_config(cfg)
         log.info("Config saved via CLI flags")
@@ -177,15 +182,19 @@ def _run_check(cfg) -> int:
         ok = False
         print(f"[fail] whisper - {e}")
 
+    # Check active TTS engine (kokoro or piper)
     try:
-        from .tts import Speaker
+        from .tts import create_speaker
 
-        spk = Speaker(cfg.tts_voice, cfg.tts_speed)
+        spk = create_speaker(cfg)
         audio = spk.synthesize("Check.")
-        line("kokoro", len(audio) > 0, f"voice '{cfg.tts_voice}' synthesized {len(audio) / 24000:.1f}s")
+        eng = getattr(cfg, "tts_engine", "kokoro")
+        label = getattr(cfg, "piper_model", "") if eng == "piper" else getattr(cfg, "tts_voice", "")
+        line(eng, len(audio) > 0, f"'{label}' synthesized {len(audio) / 24000:.1f}s")
     except Exception as e:  # noqa: BLE001
         ok = False
-        print(f"[fail] kokoro - {e}")
+        eng = getattr(cfg, "tts_engine", "kokoro")
+        print(f"[fail] {eng} - {e}")
 
     try:
         from .llm import LLMClient

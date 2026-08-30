@@ -13,6 +13,7 @@ dependencies = [
   "openwakeword>=0.6",
   "onnxruntime>=1.17",
   "kokoro>=0.2",
+  "piper-tts>=1.2",
   "openai>=1.30",
   "sounddevice>=0.5",
   "PySide6>=6.6",

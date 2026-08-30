@@ -69,8 +69,17 @@ class Config:
 
     whisper_model: str = "base.en"
 
+    # TTS engine: "kokoro" or "piper"
+    tts_engine: str = "kokoro"
     tts_voice: str = "af_heart"
     tts_speed: float = 1.0
+    # Piper-specific (onnx + json pair). piper_model is path to .onnx; json is derived or explicit.
+    piper_model: str = ""
+    piper_config: str = ""  # optional explicit .onnx.json path; auto-derived if empty
+    piper_speaker: int = 0  # speaker id for multi-speaker models
+    piper_length_scale: float = 1.0  # 1.0 normal, <1 faster, >1 slower
+    piper_noise_scale: float = 0.667
+    piper_noise_w: float = 0.8
 
     wake_word: str = "hey_jarvis"
     wakeword_embeddings: str = ""
@@ -152,6 +161,25 @@ def load_config() -> Config:
         # We previously forced False; now we respect the file. Only log migration note.
         log = __import__("logging").getLogger("vocalis")
         log.info("Config has continuous_listening=True — respecting user choice (say 'hey jarvis' not needed if true)")
+    # TTS engine sanity + piper defaults
+    if cfg.tts_engine not in ("kokoro", "piper"):
+        cfg.tts_engine = "kokoro"
+    cfg.tts_engine = cfg.tts_engine.strip().lower()
+    # normalize piper paths
+    if cfg.piper_model:
+        cfg.piper_model = cfg.piper_model.strip()
+    if cfg.piper_config:
+        cfg.piper_config = cfg.piper_config.strip()
+    try:
+        cfg.piper_speaker = int(cfg.piper_speaker)
+    except Exception:
+        cfg.piper_speaker = 0
+    try:
+        cfg.piper_length_scale = float(cfg.piper_length_scale)
+        if not 0.3 <= cfg.piper_length_scale <= 3.0:
+            cfg.piper_length_scale = 1.0
+    except Exception:
+        cfg.piper_length_scale = 1.0
     return cfg
 
 

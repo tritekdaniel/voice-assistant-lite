@@ -379,9 +379,17 @@ class MainWindow(QMainWindow):
         from .runner import start_session
         try:
             s = start_session(self.cfg, self.listener())
-            t = threading.Thread(target=s.run, daemon=True)
+            t = threading.Thread(target=s.run, daemon=True, name="session")
             t.start()
             self.attach_session(s)
+            self._session_thread = t  # type: ignore
+            # re-attach watchdog if present
+            try:
+                wd = getattr(self, "_watchdog", None)
+                if wd is not None:
+                    wd.attach(s, t)
+            except Exception:
+                pass
             self._on_state(State.IDLE)
         except Exception as e:
             self._on_error(f"Could not start audio: {e}")
@@ -678,13 +686,103 @@ class SettingsDialog(QDialog):
         row_wake = QHBoxLayout()
         self._btn_wake_test = QPushButton("Listen 8s — test wake word")
         self._btn_wake_test.clicked.connect(self._do_wake_test)
+        self._btn_wake_cal = QPushButton("Auto-calibrate 30s")
+        self._btn_wake_cal.setToolTip("30s wizard: 12s silence + 18s say wake word 3-5 times, auto-suggests threshold/cooldown")
+        self._btn_wake_cal.clicked.connect(self._do_wake_calibrate)
         self._lbl_wake = QLabel("")
         self._lbl_wake.setStyleSheet("color:#94a3b8;")
         row_wake.addWidget(self._btn_wake_test)
+        row_wake.addWidget(self._btn_wake_cal)
         row_wake.addWidget(self._lbl_wake, 1)
         lay.addLayout(row_wake)
         self._test_signals.sig_wake.connect(self._lbl_wake.setText)
-        self._test_signals.sig_wake_done.connect(lambda t: (self._lbl_wake.setText(t), self._btn_wake_test.setEnabled(True)))
+        self._test_signals.sig_wake_done.connect(lambda t: (self._lbl_wake.setText(t), self._btn_wake_test.setEnabled(True), self._btn_wake_cal.setEnabled(True)))
+
+        # --- Sounds (swappable earcons) ---
+        from PySide6.QtWidgets import QCheckBox as _QCB
+        sounds_form = QFormLayout()
+        sounds_form.setLabelAlignment(Qt.AlignRight)
+        self._sounds_enabled = _QCB("Enable earcons (wake/finished/timer/alarm sounds)")
+        self._sounds_enabled.setChecked(bool(getattr(cfg, "sound_enabled", True)))
+        self._sounds_enabled.setToolTip("Master mute for all earcons. Uncheck for silent operation.")
+        sounds_form.addRow("", self._sounds_enabled)
+        self._sound_volume = QDoubleSpinBox()
+        self._sound_volume.setRange(0.05, 1.0)
+        self._sound_volume.setSingleStep(0.05)
+        self._sound_volume.setValue(float(getattr(cfg, "sound_volume", 0.7)))
+        self._sound_volume.setSuffix(" vol")
+        sounds_form.addRow("Volume", self._sound_volume)
+        # helper to make sound row
+        def _make_sound_row(label: str, attr: str, default_name: str, tooltip: str):
+            le = QLineEdit(getattr(cfg, attr, "") or "")
+            le.setPlaceholderText(f"Custom .wav/.mp3/.ogg or empty = {default_name}")
+            le.setToolTip(tooltip)
+            btn_browse = QPushButton("Browse…")
+            btn_preview = QPushButton("Preview")
+            btn_reset = QPushButton("Default")
+            row = QHBoxLayout()
+            row.addWidget(le, 1)
+            row.addWidget(btn_browse)
+            row.addWidget(btn_preview)
+            row.addWidget(btn_reset)
+            # closures
+            def _browse(le=le):
+                path, _ = QFileDialog.getOpenFileName(self, f"Choose {label} sound", "", "Audio (*.wav *.mp3 *.ogg *.flac);;All files (*.*)")
+                if path:
+                    le.setText(path)
+            def _preview(le=le):
+                p = le.text().strip()
+                if not p:
+                    # preview default
+                    try:
+                        from .sounds import Sounds
+                        from .audio_io import Playback
+                        s = Sounds(Playback(), cfg)
+                        # temporarily set cfg for preview? just preview file directly
+                        ok = s.preview_file(p) if p else s.preview({"Wake": "wake", "Finished": "finished", "Timer set": "timer_set", "Alarm": "alarm"}.get(label, "wake"))
+                        if not ok:
+                            QMessageBox.information(self, "Preview", f"No audio produced for {label}. Check path or output device.")
+                    except Exception as e:
+                        QMessageBox.warning(self, "Preview", f"Failed: {e}")
+                    return
+                try:
+                    from .sounds import Sounds
+                    from .audio_io import Playback
+                    s = Sounds(Playback(), cfg)
+                    # use custom path directly
+                    ok = s.preview_file(p)
+                    if not ok:
+                        # try default preview
+                        ok2 = s.preview({"Wake": "wake", "Finished": "finished", "Timer set": "timer_set", "Alarm": "alarm"}.get(label, "wake"))
+                        if not ok2:
+                            QMessageBox.information(self, "Preview", f"No audio for {label}")
+                except Exception as e:
+                    QMessageBox.warning(self, "Preview", f"Failed: {e}")
+            def _reset(le=le):
+                le.clear()
+            btn_browse.clicked.connect(_browse)
+            btn_preview.clicked.connect(_preview)
+            btn_reset.clicked.connect(_reset)
+            return le, btn_browse, btn_preview, btn_reset, row
+        self._sound_wake_le, _, _, _, row_wake_snd = _make_sound_row("Wake", "sound_wake_path", "wake-up.ogg", "Played after wake word. Empty uses bundled wake-up.ogg")
+        sounds_form.addRow("Wake sound", row_wake_snd)
+        self._sound_finished_le, _, _, _, row_fin = _make_sound_row("Finished", "sound_finished_path", "finished-listening.ogg", "Played when listening ends (endpoint).")
+        sounds_form.addRow("Finished sound", row_fin)
+        self._sound_timer_le, _, _, _, row_tim = _make_sound_row("Timer set", "sound_timer_set_path", "timer-set.mp3", "Played when timer is set.")
+        sounds_form.addRow("Timer set sound", row_tim)
+        self._sound_alarm_le, _, _, _, row_alm = _make_sound_row("Alarm", "sound_alarm_path", "Lithium.mp3 (or alarm_tone)", "Looped alarm tone for timer & alarms. Also used for Alarms.")
+        sounds_form.addRow("Alarm sound", row_alm)
+        lay.addLayout(sounds_form)
+        # test all sounds
+        row_snd_test = QHBoxLayout()
+        self._btn_snd_test_all = QPushButton("Test All Sounds")
+        self._btn_snd_test_all.setToolTip("Play wake → finished → timer-set → alarm in sequence")
+        self._btn_snd_test_all.clicked.connect(self._preview_all_sounds)
+        self._lbl_snd_test = QLabel("")
+        self._lbl_snd_test.setStyleSheet("color:#94a3b8;")
+        row_snd_test.addWidget(self._btn_snd_test_all)
+        row_snd_test.addWidget(self._lbl_snd_test, 1)
+        lay.addLayout(row_snd_test)
 
         # STT — smaller/faster vs larger/more accurate
         form4 = QFormLayout()
@@ -747,6 +845,25 @@ class SettingsDialog(QDialog):
 
         lay.addLayout(form6)
 
+        # Behavior (continuous listening etc — previously hidden)
+        beh_form = QFormLayout()
+        beh_form.setLabelAlignment(Qt.AlignRight)
+        from PySide6.QtWidgets import QCheckBox as _QCB2
+        self._cont_listen = _QCB2("Continuous listening (no wake word after reply)")
+        self._cont_listen.setChecked(bool(getattr(cfg, "continuous_listening", False)))
+        self._cont_listen.setToolTip("If on, after speaking returns to LISTENING for follow-up without saying Hey Jarvis again. Off = requires wake word each time.")
+        beh_form.addRow("", self._cont_listen)
+        self._grace = QDoubleSpinBox()
+        self._grace.setRange(2.0, 60.0)
+        self._grace.setSingleStep(1.0)
+        self._grace.setValue(float(getattr(cfg, "listen_grace_seconds", 10.0)))
+        self._grace.setSuffix(" s")
+        self._grace.setToolTip("Grace window after speaking where idle timeout is suppressed (only when continuous listening).")
+        beh_form.addRow("Listen grace", self._grace)
+        self._cont_listen.toggled.connect(lambda on: self._grace.setEnabled(on))
+        self._grace.setEnabled(self._cont_listen.isChecked())
+        lay.addLayout(beh_form)
+
         # Preset -> fill handling
         self._preset.currentTextChanged.connect(self._apply_preset)
         self._preset.currentTextChanged.connect(lambda _: self._refresh_models())
@@ -779,6 +896,70 @@ class SettingsDialog(QDialog):
         lf_btns.addStretch(1)
         lf_lay.addLayout(lf_btns)
         lay.addWidget(logs_frame)
+
+        # --- Alarms (offline) ---
+        alarms_frame = QFrame()
+        alarms_frame.setStyleSheet("QFrame { border:1px solid #1e293b; border-radius:8px; background:#0b1220; }")
+        af_lay = QVBoxLayout(alarms_frame)
+        af_lay.setContentsMargins(10, 8, 10, 8)
+        af_lay.setSpacing(6)
+        af_title = QLabel("Alarms (offline)")
+        af_title.setStyleSheet("color:#e2e8f0; font-weight:600; font-size:12px; border:none; background:transparent;")
+        af_lay.addWidget(af_title)
+        af_desc = QLabel("Voice: 'set alarm for 07:30 daily' or use LLM tool. Stored in data_dir()/alarms.json — no cloud.")
+        af_desc.setStyleSheet("color:#94a3b8; font-size:11px; border:none; background:transparent;")
+        af_desc.setWordWrap(True)
+        af_lay.addWidget(af_desc)
+        self._alarms_list = QLabel("No alarms loaded")
+        self._alarms_list.setStyleSheet("color:#94a3b8; font-size:11px; border:none; background:transparent;")
+        self._alarms_list.setWordWrap(True)
+        self._alarms_list.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        af_lay.addWidget(self._alarms_list)
+        af_row = QHBoxLayout()
+        self._alarm_time = QLineEdit()
+        self._alarm_time.setPlaceholderText("HH:MM or YYYY-MM-DDTHH:MM (e.g. 07:30)")
+        self._alarm_label = QLineEdit()
+        self._alarm_label.setPlaceholderText("label")
+        self._alarm_rec = QComboBox()
+        self._alarm_rec.addItems(["once", "daily", "weekly", "weekdays"])
+        self._btn_alarm_add = QPushButton("Add Alarm")
+        self._btn_alarm_add.clicked.connect(self._add_alarm)
+        self._btn_alarm_refresh = QPushButton("Refresh")
+        self._btn_alarm_refresh.clicked.connect(self._refresh_alarms)
+        af_row.addWidget(self._alarm_time, 1)
+        af_row.addWidget(self._alarm_label, 1)
+        af_row.addWidget(self._alarm_rec)
+        af_row.addWidget(self._btn_alarm_add)
+        af_row.addWidget(self._btn_alarm_refresh)
+        af_lay.addLayout(af_row)
+        lay.addWidget(alarms_frame)
+        QTimer.singleShot(400, self._refresh_alarms)
+
+        # --- Updates ---
+        upd_frame = QFrame()
+        upd_frame.setStyleSheet("QFrame { border:1px solid #1e293b; border-radius:8px; background:#0b1220; }")
+        uf_lay = QVBoxLayout(upd_frame)
+        uf_lay.setContentsMargins(10, 8, 10, 8)
+        uf_lay.setSpacing(6)
+        uf_title = QLabel("Updates")
+        uf_title.setStyleSheet("color:#e2e8f0; font-weight:600; font-size:12px; border:none; background:transparent;")
+        uf_lay.addWidget(uf_title)
+        self._upd_repo = QLineEdit(getattr(cfg, "update_repo", "") or "")
+        self._upd_repo.setPlaceholderText("owner/repo (e.g. anomalyco/vocalis) — empty = disabled")
+        uf_lay.addWidget(self._upd_repo)
+        upd_row = QHBoxLayout()
+        self._btn_upd_check = QPushButton("Check for update")
+        self._btn_upd_check.clicked.connect(self._check_update)
+        self._btn_upd_pull = QPushButton("Update (git pull)")
+        self._btn_upd_pull.clicked.connect(self._do_update)
+        self._lbl_upd = QLabel("")
+        self._lbl_upd.setStyleSheet("color:#94a3b8; font-size:11px; border:none; background:transparent;")
+        self._lbl_upd.setWordWrap(True)
+        upd_row.addWidget(self._btn_upd_check)
+        upd_row.addWidget(self._btn_upd_pull)
+        upd_row.addWidget(self._lbl_upd, 1)
+        uf_lay.addLayout(upd_row)
+        lay.addWidget(upd_frame)
 
         # --- Danger Zone ---
         danger = QFrame()
@@ -1122,6 +1303,199 @@ class SettingsDialog(QDialog):
         self._prune_workers()
         self._workers.append(t)
 
+    def _do_wake_calibrate(self) -> None:
+        self._btn_wake_test.setEnabled(False)
+        self._btn_wake_cal.setEnabled(False)
+        self._lbl_wake.setText("Calibrating 30s: 12s silence, then say wake word 3-5 times loudly…")
+        spec = self._wake.currentText().strip()
+        thr = float(self._wake_thr.value())
+        cd = int(self._wake_cd.value())
+        emb = self._wake_emb.text().strip()
+        in_dev = self._in_dev.currentData()
+
+        def worker():
+            try:
+                from .calibration import calibrate_wake_word
+                res = calibrate_wake_word(spec, thr, cd, emb, in_dev, duration_total=30.0)
+                # live-apply suggestion
+                sug = res.get("suggested_threshold")
+                sug_cd = res.get("suggested_cooldown_ms")
+                # emit to UI thread via safe emit
+                self._safe_emit(self._test_signals.sig_wake, f"Calib: noise {res.get('peak_noise'):.2f} wake {res.get('peak_wake'):.2f} gap {res.get('gap'):.2f} → thr {sug:.2f} cd {sug_cd}ms")
+                # auto-apply to spinners
+                try:
+                    from PySide6.QtCore import QTimer
+                    def apply():
+                        try:
+                            self._wake_thr.setValue(float(sug))
+                            self._wake_cd.setValue(int(sug_cd))
+                            if res.get("warning"):
+                                self._lbl_wake.setToolTip(res["warning"])
+                        except Exception:
+                            pass
+                    QTimer.singleShot(0, apply)
+                except Exception:
+                    pass
+                self._safe_emit(self._test_signals.sig_wake_done, f"Done — suggested threshold {sug:.2f} cooldown {sug_cd}ms | {res.get('warning') or 'say Save to persist'}")
+            except Exception as e:
+                self._safe_emit(self._test_signals.sig_wake_done, f"Calibrate failed: {e}")
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        self._prune_workers()
+        self._workers.append(t)
+
+    def _preview_all_sounds(self) -> None:
+        self._btn_snd_test_all.setEnabled(False)
+        self._lbl_snd_test.setText("Playing…")
+        # capture paths
+        paths = {
+            "wake": self._sound_wake_le.text().strip(),
+            "finished": self._sound_finished_le.text().strip(),
+            "timer_set": self._sound_timer_le.text().strip(),
+            "alarm": self._sound_alarm_le.text().strip(),
+        }
+        vol = float(self._sound_volume.value())
+        enabled = bool(self._sounds_enabled.isChecked())
+        out_dev = self._out_dev.currentData()
+        def worker():
+            try:
+                from .sounds import Sounds
+                from .audio_io import Playback
+                from .config import Config as _Cfg
+                # make temp cfg for preview
+                tmp = _Cfg()
+                tmp.sound_wake_path = paths["wake"]
+                tmp.sound_finished_path = paths["finished"]
+                tmp.sound_timer_set_path = paths["timer_set"]
+                tmp.sound_alarm_path = paths["alarm"]
+                tmp.sound_volume = vol
+                tmp.sound_enabled = enabled
+                if not enabled:
+                    self._safe_emit(self._test_signals.sig_tts, "Sounds disabled — enable to preview")
+                    return
+                pb = Playback(device=out_dev)
+                pb.start()
+                s = Sounds(pb, tmp)
+                for kind in ["wake", "finished", "timer_set", "alarm"]:
+                    ok = s.preview(kind)
+                    if not ok:
+                        # try file directly if custom path failed
+                        p = paths[kind]
+                        if p:
+                            s.preview_file(p)
+                    time.sleep(0.7)
+                pb.stop()
+                self._safe_emit(self._test_signals.sig_tts, "Preview done")
+                # update label on GUI thread
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(0, lambda: (self._lbl_snd_test.setText("Played wake → finished → timer → alarm"), self._btn_snd_test_all.setEnabled(True)))
+            except Exception as e:
+                self._safe_emit(self._test_signals.sig_tts, f"Preview failed: {e}")
+                try:
+                    from PySide6.QtCore import QTimer
+                    QTimer.singleShot(0, lambda: self._btn_snd_test_all.setEnabled(True))
+                except Exception:
+                    pass
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        self._prune_workers()
+        self._workers.append(t)
+
+    def _refresh_alarms(self) -> None:
+        try:
+            from .alarms import _alarms_path
+            import json
+            p = _alarms_path()
+            if not p.exists():
+                self._alarms_list.setText("No alarms")
+                return
+            data = json.loads(p.read_text(encoding="utf-8"))
+            alarms = data.get("alarms", [])
+            if not alarms:
+                self._alarms_list.setText("No alarms")
+                return
+            lines = []
+            for a in alarms:
+                en = "on" if a.get("enabled", True) else "off"
+                lines.append(f"#{a.get('id')} {a.get('label')} at {a.get('at')} ({a.get('recurrence')}) [{en}]")
+            self._alarms_list.setText("\n".join(lines))
+        except Exception as e:
+            self._alarms_list.setText(f"Alarms error: {e}")
+
+    def _add_alarm(self) -> None:
+        t = self._alarm_time.text().strip()
+        label = self._alarm_label.text().strip() or "alarm"
+        rec = self._alarm_rec.currentText().strip()
+        if not t:
+            QMessageBox.warning(self, "Alarm", "Enter HH:MM or YYYY-MM-DDTHH:MM")
+            return
+        if len(t) <= 5 and ":" in t and "T" not in t:
+            from datetime import datetime as _dt
+            t = _dt.now().strftime("%Y-%m-%dT") + t + ":00"
+        try:
+            from .alarms import AlarmManager
+            from .sounds import Sounds
+            from .audio_io import Playback
+            # ephemeral manager to add (will persist to file)
+            am = AlarmManager(Sounds(Playback()))
+            am.add_alarm(t, label, rec)
+            am.stop()
+            self._refresh_alarms()
+            self._alarm_time.clear()
+        except Exception as e:
+            QMessageBox.warning(self, "Alarm", f"Failed: {e}")
+
+    def _check_update(self) -> None:
+        repo = self._upd_repo.text().strip()
+        if not repo:
+            self._lbl_upd.setText("Set owner/repo first")
+            return
+        self._btn_upd_check.setEnabled(False)
+        self._lbl_upd.setText("Checking…")
+        def worker():
+            try:
+                from .updater import check_for_update
+                has, latest, url, notes = check_for_update(repo)
+                if has:
+                    self._safe_emit(self._test_signals.sig_llm, f"Update available {latest}: {url}")
+                    # reuse sig_llm for label? use direct QTimer
+                    from PySide6.QtCore import QTimer
+                    def set_txt():
+                        self._lbl_upd.setText(f"Update {latest} available: {url}")
+                        self._btn_upd_check.setEnabled(True)
+                    QTimer.singleShot(0, set_txt)
+                else:
+                    from PySide6.QtCore import QTimer
+                    def set_txt2():
+                        self._lbl_upd.setText(f"No update (latest {latest})" if latest else "No update / repo not found")
+                        self._btn_upd_check.setEnabled(True)
+                    QTimer.singleShot(0, set_txt2)
+            except Exception as e:
+                from PySide6.QtCore import QTimer
+                def set_err():
+                    self._lbl_upd.setText(f"Check failed: {e}")
+                    self._btn_upd_check.setEnabled(True)
+                QTimer.singleShot(0, set_err)
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        self._prune_workers()
+        self._workers.append(t)
+
+    def _do_update(self) -> None:
+        repo = self._upd_repo.text().strip()
+        if not repo:
+            QMessageBox.warning(self, "Update", "Set owner/repo first (e.g. anomalyco/vocalis)")
+            return
+        if QMessageBox.question(self, "Update", f"Pull latest from {repo}? This runs git pull / install scripts.") != QMessageBox.Yes:
+            return
+        try:
+            from .updater import spawn_update
+            spawn_update(repo)
+            QMessageBox.information(self, "Update", "Update started in background — check log and restart after it finishes.")
+        except Exception as e:
+            QMessageBox.warning(self, "Update", f"Failed: {e}")
+
     def _view_log_settings(self) -> None:
         try:
             p = log_path()
@@ -1224,7 +1598,37 @@ class SettingsDialog(QDialog):
         c.compact_after = int(self._compact_spin.value())
         # keep forget_history in sync for back-compat (preserve overrides)
         c.forget_history = not c.preserve_history
+        # sounds (swappable earcons)
+        c.sound_wake_path = self._sound_wake_le.text().strip()
+        c.sound_finished_path = self._sound_finished_le.text().strip()
+        c.sound_timer_set_path = self._sound_timer_le.text().strip()
+        c.sound_alarm_path = self._sound_alarm_le.text().strip()
+        c.sound_volume = float(self._sound_volume.value())
+        c.sound_enabled = bool(self._sounds_enabled.isChecked())
+        c.alarm_tone = c.sound_alarm_path or c.alarm_tone
+        # behavior
+        c.continuous_listening = bool(self._cont_listen.isChecked())
+        c.listen_grace_seconds = float(self._grace.value())
+        # alarms / update
+        c.update_repo = self._upd_repo.text().strip()
         self.accept()
+        # live-apply wakeword + sounds without full restart if possible
+        try:
+            parent = self.parent()
+            if parent and hasattr(parent, "_session") and getattr(parent, "_session", None):
+                sess = getattr(parent, "_session")
+                try:
+                    sess.update_wakeword(threshold=c.wakeword_threshold, cooldown_ms=c.wakeword_cooldown_ms)
+                except Exception:
+                    pass
+                try:
+                    if hasattr(sess, "_sounds") and sess._sounds:
+                        sess._sounds._cfg = c
+                        sess._sounds.reload()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _on_preserve_changed(self, _state: int) -> None:
         on = self._preserve.isChecked()
@@ -1505,6 +1909,7 @@ def launch_gui(cfg: Config) -> None:
     # start session after UI is up
     def start_session_deferred():
         from .runner import start_session
+        from .watchdog import Watchdog
 
         try:
             log.info("Starting session deferred")
@@ -1512,7 +1917,45 @@ def launch_gui(cfg: Config) -> None:
             t = threading.Thread(target=s.run, daemon=True, name="session")
             t.start()
             win.attach_session(s)
-            log.info("Session thread started")
+            # keep references for watchdog
+            win._session_thread = t  # type: ignore
+            # watchdog auto-restarts without tray intervention
+            wd = Watchdog(cfg, lambda: win, start_session)
+            wd.attach(s, t)
+            wd.start()
+            win._watchdog = wd  # type: ignore
+            # keep watchdog's session ref fresh after restart
+            def _sync_watchdog():
+                try:
+                    if hasattr(win, "_watchdog") and hasattr(win, "_session"):
+                        wd.attach(win._session, getattr(win, "_session_thread", t))  # type: ignore
+                except Exception:
+                    pass
+            sync_timer = QTimer()
+            sync_timer.timeout.connect(_sync_watchdog)
+            sync_timer.start(2000)
+            win._wd_sync_timer = sync_timer  # type: ignore
+            log.info("Session thread started with watchdog")
+            # background update check (offline-only otherwise, but update needs net)
+            try:
+                if getattr(cfg, "auto_update_check", False) and getattr(cfg, "update_repo", ""):
+                    def _bg_upd():
+                        try:
+                            from .updater import check_for_update
+                            has, latest, url, _ = check_for_update(cfg.update_repo)
+                            if has:
+                                log.info("Update available %s at %s", latest, url)
+                                try:
+                                    QTimer.singleShot(0, lambda: win._on_error(f"Update {latest} available: {url} — Settings → Updates"))
+                                    if tray:
+                                        tray.showMessage("Vocalis update", f"{latest} available", QSystemTrayIcon.Information, 5000)
+                                except Exception:
+                                    pass
+                        except Exception as e:
+                            log.debug("Background update check failed: %s", e)
+                    threading.Thread(target=_bg_upd, daemon=True).start()
+            except Exception:
+                pass
         except BaseException as e:
             log.exception("Audio start failed: %s", e)
             # Keep window open with error + log path, don't quit

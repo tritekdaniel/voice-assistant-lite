@@ -30,12 +30,19 @@ Get-ChildItem -Path $root -Filter "*.egg-info" -Directory -ErrorAction SilentlyC
   Remove-Item -Recurse -Force -LiteralPath $_.FullName
 }
 
-# 3. desktop shortcut
+# 3. desktop shortcut + Start Menu folder (install.ps1 creates Programs\Vocalis\*)
 try {
   $lnk = Join-Path ([Environment]::GetFolderPath("Desktop")) "Vocalis.lnk"
   if (Test-Path $lnk) { Remove-Item -Force -LiteralPath $lnk; Write-Host "Removed Desktop shortcut" }
-  $appEntry = Join-Path $env:LOCALAPPDATA "Microsoft\Windows\Start Menu\Programs\Vocalis.lnk"
-  if (Test-Path $appEntry) { Remove-Item -Force -LiteralPath $appEntry }
+  # legacy single file (pre-0.1.0)
+  $legacy = Join-Path $env:LOCALAPPDATA "Microsoft\Windows\Start Menu\Programs\Vocalis.lnk"
+  if (Test-Path $legacy) { Remove-Item -Force -LiteralPath $legacy }
+  # current: Programs\Vocalis folder with Vocalis.lnk + Uninstall Vocalis.lnk
+  $startDir = Join-Path ([Environment]::GetFolderPath("Programs")) "Vocalis"
+  if (Test-Path $startDir) { Remove-Item -Recurse -Force -LiteralPath $startDir; Write-Host "Removed Start Menu folder Vocalis" }
+  # also LOCALAPPDATA variant (some machines)
+  $altStart = Join-Path $env:LOCALAPPDATA "Microsoft\Windows\Start Menu\Programs\Vocalis"
+  if (Test-Path $altStart) { Remove-Item -Recurse -Force -LiteralPath $altStart }
 } catch {}
 
 # 4. config / models (only with -Clean)
@@ -53,10 +60,11 @@ if ($Clean) {
   } else { Write-Host "No config dir at $cfg (nothing to do)" }
 
   if ($KeepModels) {
-    Write-Host "-KeepModels: leaving models under $data"
+    Write-Host "-KeepModels: leaving models + alarms under $data (keeps ~700 MB models and offline alarms.json)"
+    # still clean corrupted extras but keep data dir
   } else {
     if (Test-Path $data) {
-      Write-Host "Removing data/models at $data ..."
+      Write-Host "Removing data/models/alarms at $data (includes alarms.json) ..."
       Remove-Item -Recurse -Force -LiteralPath $data
     } else { Write-Host "No data dir at $data" }
   }

@@ -14,6 +14,7 @@ dependencies = [
   "onnxruntime>=1.17",
   "kokoro>=0.2",
   "openai>=1.30",
+  "httpx>=0.26",
   "sounddevice>=0.5",
   "PySide6>=6.6",
   "platformdirs>=4",

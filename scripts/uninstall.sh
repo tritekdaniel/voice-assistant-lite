@@ -35,9 +35,9 @@ if [ "$CLEAN" -eq 1 ]; then
   DATA="${XDG_DATA_HOME:-$HOME/.local/share}/vocalis"
   if [ -d "$CFG" ]; then echo "Removing config at $CFG ..."; rm -rf "$CFG"; else echo "No config at $CFG"; fi
   if [ "$KEEP_MODELS" -eq 1 ]; then
-    echo "--keep-models: leaving $DATA"
+    echo "--keep-models: leaving $DATA (keeps ~700 MB models and offline alarms.json)"
   else
-    if [ -d "$DATA" ]; then echo "Removing data/models at $DATA ..."; rm -rf "$DATA"; else echo "No data at $DATA"; fi
+    if [ -d "$DATA" ]; then echo "Removing data/models/alarms at $DATA (includes alarms.json) ..."; rm -rf "$DATA"; else echo "No data at $DATA"; fi
   fi
 else
   echo "Keeping user config/models. Re-run with --clean to remove them."

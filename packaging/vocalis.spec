@@ -22,6 +22,15 @@ icon = ICON_ICO if Path(ICON_ICO).exists() else (ICON_PNG if Path(ICON_PNG).exis
 block_cipher = None
 
 hidden = []
+# App modules — ensure new features are bundled even if dynamically imported
+hidden += [
+    "vocalis.watchdog", "vocalis.alarms", "vocalis.calibration", "vocalis.updater",
+    "vocalis.sounds", "vocalis.timer", "vocalis.session", "vocalis.audio_io",
+    "vocalis.stt", "vocalis.tts", "vocalis.llm", "vocalis.wakeword", "vocalis.bootstrap",
+    "vocalis.config", "vocalis.logger", "vocalis.textsplit", "vocalis.runner",
+]
+# http stack for llm.py/updater.py (dynamically imported inside functions, missed by static analysis)
+hidden += ["httpx", "httpcore", "anyio", "h11", "idna", "sniffio"]
 # Keep hiddenimports lean — collecting all of torch/scipy/faster_whisper OOMs Linux even on 32GB.
 # Let PyInstaller discover via entry.py; only add what it misses. On Linux, be extra lean.
 import sys as _sys_hidden

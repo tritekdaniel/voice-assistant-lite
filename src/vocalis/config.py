@@ -19,6 +19,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "You can set timers: when the user asks for a timer, call set_timer with seconds (e.g., 60 for 1 min). "
     "After calling set_timer, say 'Timer set' and nothing more about the sound. "
     "A sound will loop when the timer fires; the user can say 'stop timer' to cancel it. "
+    "You can also set offline alarms: call set_alarm with time 'HH:MM' or 'YYYY-MM-DDTHH:MM:SS' and recurrence once/daily/weekly/weekdays. "
     "If asked what sound plays, say 'a chime' and do not name files."
 )
 
@@ -85,6 +86,24 @@ class Config:
     wakeword_embeddings: str = ""
     wakeword_threshold: float = 0.5
     wakeword_cooldown_ms: int = 800
+
+    # offline alarms / calendar
+    alarms_enabled: bool = True
+    alarm_tone: str = "Lithium.mp3"
+
+    # swappable sounds — empty = default asset, else absolute path to .wav/.mp3/.ogg
+    sound_wake_path: str = ""          # default assets/wake-up.ogg
+    sound_finished_path: str = ""      # default assets/finished-listening.ogg
+    sound_timer_set_path: str = ""     # default assets/timer-set.mp3
+    sound_alarm_path: str = ""         # default alarm_tone / assets/Lithium.mp3
+    sound_volume: float = 0.7           # 0.1-1.0 peak normalize
+    sound_enabled: bool = True          # master mute for earcons
+
+    # auto-update (offline-friendly: opt-in)
+    update_repo: str = ""
+    update_channel: str = "stable"
+    auto_update_check: bool = False
+    update_last_check: float = 0.0
 
     vad_rms_dbfs: float = -42.0
     vad_silence_seconds: float = 0.8
@@ -212,6 +231,23 @@ def load_config() -> Config:
             cfg.piper_length_scale = 1.0
     except Exception:
         cfg.piper_length_scale = 1.0
+    # sounds sanity
+    for attr in ("sound_wake_path", "sound_finished_path", "sound_timer_set_path", "sound_alarm_path", "alarm_tone"):
+        try:
+            v = getattr(cfg, attr, "")
+            if v:
+                setattr(cfg, attr, v.strip())
+        except Exception:
+            pass
+    try:
+        cfg.sound_volume = float(cfg.sound_volume)
+        if not 0.05 <= cfg.sound_volume <= 1.0:
+            cfg.sound_volume = 0.7
+    except Exception:
+        cfg.sound_volume = 0.7
+    # migrate alarm_tone -> sound_alarm_path
+    if cfg.alarm_tone and cfg.alarm_tone != "Lithium.mp3" and not cfg.sound_alarm_path:
+        cfg.sound_alarm_path = cfg.alarm_tone
     return cfg
 
 

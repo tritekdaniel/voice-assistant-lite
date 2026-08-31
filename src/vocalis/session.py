@@ -11,6 +11,7 @@ import time
 import numpy as np
 
 from .audio_io import FRAME_SAMPLES, AudioIn, Playback
+from .alarms import AlarmManager, get_alarm_tools
 from .llm import History, LLMClient
 from .logger import get_logger
 from .sounds import Sounds
@@ -112,7 +113,7 @@ class Session:
 
     def __init__(self, cfg, audio_in: AudioIn, playback: Playback, wakeword: WakeWord,
                  stt: Transcriber, llm: LLMClient, history: History, tts: Speaker,
-                 listener: Listener, sounds: Sounds | None = None, timer: TimerManager | None = None):
+                 listener: Listener, sounds: Sounds | None = None, timer: TimerManager | None = None, alarms: AlarmManager | None = None):
         self.cfg = cfg
         self._audio_in = audio_in
         self._playback = playback
@@ -124,6 +125,7 @@ class Session:
         self.listener = listener
         self._sounds = sounds
         self._timer = timer
+        self._alarms = alarms
 
         self._frames: queue.Queue[np.ndarray] = queue.Queue()
         self._wake_frames: queue.Queue[np.ndarray] = queue.Queue()
@@ -228,6 +230,11 @@ class Session:
                 self._sounds.stop_timer_loop()
             except Exception:
                 pass
+        if self._alarms is not None:
+            try:
+                self._alarms.stop()
+            except Exception:
+                pass
         try:
             self._playback.stop()
             log.debug("Playback stopped")
@@ -247,6 +254,18 @@ class Session:
     @property
     def stopped(self) -> bool:
         return self._stop.is_set()
+
+    def update_wakeword(self, threshold: float | None = None, cooldown_ms: int | None = None):
+        try:
+            if threshold is not None and hasattr(self._wakeword, "set_threshold"):
+                self._wakeword.set_threshold(float(threshold))
+            elif threshold is not None:
+                self._wakeword.threshold = float(threshold)
+            if cooldown_ms is not None and hasattr(self._wakeword, "set_cooldown"):
+                self._wakeword.set_cooldown(int(cooldown_ms))
+            log.info("Live wakeword updated threshold=%s cooldown=%s", threshold, cooldown_ms)
+        except Exception as e:
+            log.warning("Live wakeword update failed: %s", e)
 
     # -- wake word thread ---------------------------------------------------
 
@@ -458,13 +477,21 @@ class Session:
 
     def _think_step(self) -> None:
         log.info("THINKING: calling LLM %s (temp %.2f, %d history msgs, forget=%s)", self.cfg.llm_model, self.cfg.temperature, len(self._history.messages()), getattr(self.cfg, "forget_history", False))
-        # include timer tools if available
+        # include timer + alarm tools if available
         tools = None
+        all_tools: list[dict] = []
         if self._timer is not None:
             try:
-                tools = get_timer_tools()
+                all_tools.extend(get_timer_tools())
             except Exception:
-                tools = None
+                pass
+        if self._alarms is not None and getattr(self.cfg, "alarms_enabled", True):
+            try:
+                all_tools.extend(get_alarm_tools())
+            except Exception:
+                pass
+        if all_tools:
+            tools = all_tools
         splitter = SentenceBuffer()
         reply_parts: list[str] = []
         gen = None
@@ -522,6 +549,37 @@ class Session:
                         tool_calls_handled = True
                     elif name == "timer_status":
                         res = self._timer.status_message() if self._timer else "No timer"
+                        self._speak_sentence(res)
+                        tool_calls_handled = True
+                    elif name == "set_alarm":
+                        t = args.get("time") or args.get("at") or ""
+                        # handle HH:MM short form -> today
+                        if t and len(t) <= 5 and ":" in t and "T" not in t:
+                            from datetime import datetime as _dt
+                            t = _dt.now().strftime("%Y-%m-%dT") + t + ":00"
+                        label = args.get("label", "alarm")
+                        rec = args.get("recurrence", "once")
+                        try:
+                            res_d = self._alarms.add_alarm(t, label, rec) if self._alarms else {"error": "no alarms"}
+                            res = f"Alarm set for {res_d.get('at')} ({rec}) {label}"
+                        except Exception as e:
+                            res = f"Alarm failed: {e}"
+                        self._history.add_user(f"[tool set_alarm {t} -> {res}]")
+                        self._speak_sentence(res)
+                        tool_calls_handled = True
+                    elif name == "list_alarms":
+                        lst = self._alarms.list_alarms() if self._alarms else []
+                        if not lst:
+                            res = "No alarms."
+                        else:
+                            parts = [f"#{a['id']} {a['label']} at {a['at']} ({a['recurrence']}) {'on' if a['enabled'] else 'off'}" for a in lst]
+                            res = "; ".join(parts)
+                        self._speak_sentence(res)
+                        tool_calls_handled = True
+                    elif name == "cancel_alarm":
+                        aid = int(args.get("alarm_id", 0))
+                        ok = self._alarms.remove_alarm(aid) if self._alarms else False
+                        res = f"Alarm #{aid} cancelled." if ok else f"No alarm #{aid}"
                         self._speak_sentence(res)
                         tool_calls_handled = True
                 except Exception as e:
@@ -628,11 +686,18 @@ class SessionFactory:
         self.cfg = cfg
 
     def build(self, audio_in: AudioIn, playback: Playback, listener: Listener) -> Session:
-        # sounds and timer are created per session and share playback
-        sounds = Sounds(playback)
+        # sounds and timer and alarms are created per session and share playback
+        sounds = Sounds(playback, self.cfg)
         # preload will be called in Session.start(), but we can also preload now
         from .sounds import Sounds as _S  # noqa: F811
         timer = TimerManager(sounds)
+        alarms = None
+        if getattr(self.cfg, "alarms_enabled", True):
+            try:
+                alarms = AlarmManager(sounds)
+            except Exception as e:
+                from .logger import get_logger
+                get_logger(__name__).warning("Alarm init failed: %s", e)
         # TTS: kokoro or piper via factory
         try:
             tts = create_speaker(self.cfg)  # type: ignore[assignment]
@@ -656,4 +721,5 @@ class SessionFactory:
             listener,
             sounds=sounds,
             timer=timer,
+            alarms=alarms,
         )

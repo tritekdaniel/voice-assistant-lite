@@ -43,6 +43,7 @@ def start_session(cfg: Config, listener: Listener) -> Session:
 
 
 def run_headless(cfg: Config) -> None:
+    from .watchdog import Watchdog
     listener = ConsoleListener()
     log.info("Headless start: base_url=%s model=%s", cfg.llm_base_url, cfg.llm_model)
     print("vocalis (headless) - say the wake word to start. Ctrl+C to quit.")
@@ -50,21 +51,37 @@ def run_headless(cfg: Config) -> None:
     session = start_session(cfg, listener)
     t = threading.Thread(target=session.run, daemon=True, name="session")
     t.start()
+    # watchdog auto-restarts without manual intervention
+    wd = Watchdog(cfg, lambda: None, start_session, max_restarts=5)
+    wd.attach(session, t)
+    wd.start()
     try:
         while not session.stopped:
-            if not t.is_alive():
-                log.critical("Session thread died unexpectedly — exiting headless loop")
-                print("[error] Session crashed — see log for details")
-                break
+            # watchdog handles restart; headless just waits
             time.sleep(0.2)
+            # keep watchdog's session reference fresh
+            try:
+                # if watchdog restarted, update local refs
+                if wd._session is not session:
+                    session = wd._session  # type: ignore
+                    t = wd._thread  # type: ignore
+            except Exception:
+                pass
     except KeyboardInterrupt:
         log.info("Headless KeyboardInterrupt")
     except BaseException as e:
         log.critical("Headless died: %s", e, exc_info=True)
         raise
     finally:
+        try:
+            wd.stop()
+        except Exception:
+            pass
         log.info("Headless stopping")
-        session.stop()
+        try:
+            session.stop()
+        except Exception:
+            pass
         log.info("Headless stopped")
         from .logger import flush
         flush()

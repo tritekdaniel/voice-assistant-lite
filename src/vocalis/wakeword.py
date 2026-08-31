@@ -490,5 +490,11 @@ class WakeWord:
             return True
         return False
 
+    def set_threshold(self, threshold: float) -> None:
+        self.threshold = float(max(0.05, min(0.95, threshold)))
+
+    def set_cooldown(self, cooldown_ms: int) -> None:
+        self._cooldown_s = max(0.1, float(cooldown_ms) / 1000.0)
+
     def reset(self) -> None:
         self.error = None

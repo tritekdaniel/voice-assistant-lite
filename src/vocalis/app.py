@@ -102,6 +102,17 @@ WHISPER_INFO: dict[str, str] = {
 # No hardcoded LLM list — models are discovered via /v1/models from the provider.
 # Hints are intentionally empty; Refresh populates the dropdown from the live server.
 
+def _norm_model_app(s: str) -> str:
+    """Normalize model id like config._norm_model_id / llm._norm_id (gguf -> basename)."""
+    s = (s or "").strip().lstrip("/\\").strip()
+    low = s.lower()
+    if low.endswith((".gguf", ".bin", ".onnx")):
+        if "\\" in s:
+            s = s.replace("\\", "/").split("/")[-1]
+        elif "/" in s and ":" not in s:
+            s = s.split("/")[-1]
+    return s.strip()
+
 
 def _make_icon() -> QIcon:
     pm = QPixmap(128, 128)
@@ -466,10 +477,13 @@ class SettingsDialog(QDialog):
         self._model.setEditable(True)
         self._model.setInsertPolicy(QComboBox.NoInsert)
         self._model.setMinimumWidth(260)
-        cur_model = (cfg.llm_model or "").strip().lstrip("/\\").strip()
+        cur_model = _norm_model_app(cfg.llm_model or "")
         # Store last fetched ids to validate selection on save
         self._last_fetched_ids: list[str] = []
-        self._model.addItems([cur_model] if cur_model else [])
+        if cur_model:
+            self._model.addItem(cur_model, cur_model)
+            self._model.setCurrentIndex(0)
+        # ensure lineEdit shows it even if editable
         self._model.setCurrentText(cur_model)
         self._model.setToolTip("Click Refresh to load models from the provider via /v1/models — selected model will be auto-loaded on prompt (LM Studio TTL)")
         self._model.lineEdit().setPlaceholderText("select or type model id — click Refresh to fetch from provider")
@@ -1027,17 +1041,30 @@ class SettingsDialog(QDialog):
                         break
 
     def _model_id(self) -> str:
+        # For editable combo, visible text is ground truth; data may be stale if index mismatch
+        txt = self._model.currentText().strip()
+        if " —" in txt:
+            txt = txt.split(" —")[0].strip()
+        txt = txt.lstrip("/\\").strip()
+        # normalize like config/llm (handle gguf file paths -> basename)
+        def _norm(s: str) -> str:
+            s = (s or "").strip().lstrip("/\\").strip()
+            low = s.lower()
+            if low.endswith((".gguf", ".bin", ".onnx")):
+                if "\\" in s:
+                    s = s.replace("\\", "/").split("/")[-1]
+                elif "/" in s and ":" not in s:
+                    s = s.split("/")[-1]
+            return s.strip()
+        txt = _norm(txt)
         data = self._model.currentData()
-        raw = ""
-        if isinstance(data, str) and data:
-            raw = data.strip()
-        else:
-            txt = self._model.currentText().strip()
-            if " —" in txt:
-                txt = txt.split(" —")[0].strip()
-            raw = txt
-        # normalize like LLMClient does (strip leading slashes from file paths)
-        return raw.lstrip("/\\").strip()
+        if isinstance(data, str) and data.strip():
+            d = _norm(data.strip())
+            if d == txt:
+                return d
+            if d and txt and d != txt:
+                log.debug("Model combo data/text mismatch data=%r text=%r -> using text", d, txt)
+        return txt
 
     def _apply_preset(self, name: str) -> None:
         if name == "Custom":
@@ -1128,9 +1155,10 @@ class SettingsDialog(QDialog):
         self._lbl_models.setStyleSheet("color:#94a3b8; font-size:11px;")
         # use currentData if available, else currentText stripped of hint suffix
         cur_data = self._model.currentData()
-        cur = (cur_data if isinstance(cur_data, str) and cur_data else self._model.currentText()).strip().lstrip("/\\").strip()
+        cur = (cur_data if isinstance(cur_data, str) and cur_data else self._model.currentText()).strip()
         if " — hint" in cur:
-            cur = cur.split(" —")[0].strip().lstrip("/\\").strip()
+            cur = cur.split(" —")[0].strip()
+        cur = _norm_model_app(cur)
 
         def worker():
             try:
@@ -1159,11 +1187,12 @@ class SettingsDialog(QDialog):
             self._last_fetched_ids = []
             return
         self._last_fetched_ids = list(ids)
-        # normalize current (strip leading slash from old saves like "\Ling...")
+        # normalize current like config/llm (gguf -> basename)
         _cur_raw = self._model.currentData() if isinstance(self._model.currentData(), str) and self._model.currentData() else self._model.currentText()
-        cur = _cur_raw.strip().lstrip("/\\").strip()
+        cur = _cur_raw.strip()
         if " —" in cur:
-            cur = cur.split(" —")[0].strip().lstrip("/\\").strip()
+            cur = cur.split(" —")[0].strip()
+        cur = _norm_model_app(cur)
         # preserve current typed value
         self._model.blockSignals(True)
         self._model.clear()
@@ -1171,9 +1200,6 @@ class SettingsDialog(QDialog):
         if cur and cur not in ids:
             self._model.addItem(cur, cur)
         for mid in ids:
-            # avoid duplicate of cur already added
-            if cur and mid == cur:
-                continue
             self._model.addItem(mid, mid)
         # Validate selection: if cur is known and in list, keep it; otherwise keep typed but warn
         if cur and cur not in ids:
@@ -1182,7 +1208,15 @@ class SettingsDialog(QDialog):
         else:
             self._lbl_models.setText(f"Loaded {len(ids)} models — smaller (1B–3B) are fastest. Select one.")
             self._lbl_models.setStyleSheet("color:#22c55e; font-size:11px;")
-        self._model.setCurrentText(cur)
+        # Fix: editable combo setCurrentText alone may leave currentIndex at 0 (data mismatch) -> use index
+        idx = self._model.findText(cur) if cur else -1
+        if idx >= 0:
+            self._model.setCurrentIndex(idx)
+        elif cur:
+            # custom text not in list (should already be added) — ensure lineEdit shows it
+            self._model.setCurrentText(cur)
+        else:
+            self._model.setCurrentIndex(-1)
         self._model.blockSignals(False)
         log.info("Fetched %d LLM models from %s (current %r)", len(ids), self._base_url.text().strip(), cur)
 
